@@ -21,15 +21,28 @@
 //
 // نیازمندی‌های محیطی:
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-//   RESEND_API_KEY, RESEND_FROM (مثلاً: "VirtualChat <noreply@yourdomain.com>")
+//   GMAIL_USER (آدرس جیمیلی که ازش ایمیل می‌فرستیم)
+//   GMAIL_APP_PASSWORD (App Password ۱۶ رقمی، نه پسورد اصلی جیمیل)
 
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const RESEND_FROM = process.env.RESEND_FROM || 'VirtualChat <onboarding@resend.dev>';
+const GMAIL_USER = process.env.GMAIL_USER;
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
+
+let cachedTransporter = null;
+function getTransporter() {
+    if (!cachedTransporter) {
+        cachedTransporter = nodemailer.createTransport({
+            service: 'gmail',
+            auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD }
+        });
+    }
+    return cachedTransporter;
+}
 
 const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000; // ۹۰ روز
 const CODE_TTL_MS = 15 * 60 * 1000; // ۱۵ دقیقه
@@ -76,36 +89,25 @@ function hashCode(code) {
 }
 
 async function sendVerificationEmail(email, code, purpose) {
-    if (!RESEND_API_KEY) {
-        throw new Error('RESEND_API_KEY تنظیم نشده است.');
+    if (!GMAIL_USER || !GMAIL_APP_PASSWORD) {
+        throw new Error('GMAIL_USER/GMAIL_APP_PASSWORD تنظیم نشده است.');
     }
     const subject = purpose === 'register'
         ? 'کد تایید ثبت‌نام VirtualChat'
         : 'کد تایید ورود از دستگاه جدید';
-    const resp = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${RESEND_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            from: RESEND_FROM,
-            to: [email],
-            subject,
-            html: `
-                <div dir="rtl" style="font-family: sans-serif; text-align: center; padding: 24px;">
-                    <h2>${subject}</h2>
-                    <p>کد تایید شما:</p>
-                    <p style="font-size: 32px; font-weight: bold; letter-spacing: 8px;">${code}</p>
-                    <p style="color: #666;">این کد تا ۱۵ دقیقه دیگر معتبر است. اگر این درخواست را نداده‌اید، این ایمیل را نادیده بگیرید.</p>
-                </div>
-            `
-        })
+    await getTransporter().sendMail({
+        from: `VirtualChat <${GMAIL_USER}>`,
+        to: email,
+        subject,
+        html: `
+            <div dir="rtl" style="font-family: sans-serif; text-align: center; padding: 24px;">
+                <h2>${subject}</h2>
+                <p>کد تایید شما:</p>
+                <p style="font-size: 32px; font-weight: bold; letter-spacing: 8px;">${code}</p>
+                <p style="color: #666;">این کد تا ۱۵ دقیقه دیگر معتبر است. اگر این درخواست را نداده‌اید، این ایمیل را نادیده بگیرید.</p>
+            </div>
+        `
     });
-    if (!resp.ok) {
-        const errBody = await resp.text().catch(() => '');
-        throw new Error(`ارسال ایمیل ناموفق بود: ${errBody}`);
-    }
 }
 
 module.exports = async function handler(req, res) {
