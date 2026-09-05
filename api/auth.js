@@ -1,22 +1,40 @@
 // api/auth.js
 //
-// جایگزین کامل Google OAuth: کاربر با ایمیل/پسورد دلخواه خودش (نه لزوماً
-// ایمیل واقعی) ثبت‌نام و لاگین می‌کند. پسورد هرگز خام ذخیره نمی‌شود -
-// فقط هش bcrypt آن در جدول users می‌رود. بعد از لاگین موفق، یک session
-// token تصادفی (نه ایمیل/پسورد) برمی‌گردد که کلاینت در هر درخواست بعدی
-// (به api/chats.js) در هدر Authorization می‌فرستد.
+// جایگزین کامل Google OAuth: کاربر با ایمیل/پسورد دلخواه خودش ثبت‌نام و
+// لاگین می‌کند. پسورد هرگز خام ذخیره نمی‌شود - فقط هش bcrypt آن.
 //
-// POST /api/auth?action=register  body: { email, password } -> { token, email }
-// POST /api/auth?action=login     body: { email, password } -> { token, email }
+// حالا یک لایه‌ی تایید ایمیل هم اضافه شده:
+//   - register: به‌جای ساخت مستقیم یوزر، یک کد ۶ رقمی ساخته و با Resend
+//     به ایمیل کاربر ارسال می‌شود. کاربر واقعی در جدول users فقط بعد از
+//     verify ساخته می‌شود.
+//   - login: اگر device_id ارسالی برای این ایمیل قبلاً دیده نشده باشد
+//     (دستگاه جدید)، به‌جای توکن، یک کد تایید فرستاده می‌شود.
 //
-// نیازمندی‌های محیطی: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+// POST /api/auth?action=register        body: { email, password, deviceId }
+//      -> { needsVerification: true, purpose: 'register' }
+// POST /api/auth?action=login           body: { email, password, deviceId }
+//      -> { token, email }  یا  { needsVerification: true, purpose: 'login' }
+// POST /api/auth?action=verify          body: { email, code, purpose, deviceId }
+//      -> { token, email }
+// POST /api/auth?action=resend-code     body: { email, purpose, deviceId }
+//      -> { ok: true }
+//
+// نیازمندی‌های محیطی:
+//   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+//   RESEND_API_KEY, RESEND_FROM (مثلاً: "VirtualChat <noreply@yourdomain.com>")
 
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000; // ۹۰ روز - چون کاربر دیگر لازم نیست هر ساعت دوباره وارد شود
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const RESEND_FROM = process.env.RESEND_FROM || 'VirtualChat <onboarding@resend.dev>';
+
+const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000; // ۹۰ روز
+const CODE_TTL_MS = 15 * 60 * 1000; // ۱۵ دقیقه
+const MAX_ATTEMPTS = 5; // حداکثر تلاش غلط برای هر کد
+const RESEND_COOLDOWN_MS = 60 * 1000; // حداقل فاصله بین دو ارسال کد
 
 function setCors(res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -41,9 +59,53 @@ function normalizeEmail(email) {
 }
 
 function isValidEmailShape(email) {
-    // فقط یک چک شکلی ساده - این ایمیل لازم نیست واقعاً وجود داشته باشد،
-    // فقط به‌عنوان شناسه‌ی یکتای کاربر استفاده می‌شود.
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function normalizeDeviceId(deviceId) {
+    const id = String(deviceId || '').trim();
+    return id.slice(0, 128) || null;
+}
+
+function generateCode() {
+    return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+}
+
+function hashCode(code) {
+    return crypto.createHash('sha256').update(code).digest('hex');
+}
+
+async function sendVerificationEmail(email, code, purpose) {
+    if (!RESEND_API_KEY) {
+        throw new Error('RESEND_API_KEY تنظیم نشده است.');
+    }
+    const subject = purpose === 'register'
+        ? 'کد تایید ثبت‌نام VirtualChat'
+        : 'کد تایید ورود از دستگاه جدید';
+    const resp = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${RESEND_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            from: RESEND_FROM,
+            to: [email],
+            subject,
+            html: `
+                <div dir="rtl" style="font-family: sans-serif; text-align: center; padding: 24px;">
+                    <h2>${subject}</h2>
+                    <p>کد تایید شما:</p>
+                    <p style="font-size: 32px; font-weight: bold; letter-spacing: 8px;">${code}</p>
+                    <p style="color: #666;">این کد تا ۱۵ دقیقه دیگر معتبر است. اگر این درخواست را نداده‌اید، این ایمیل را نادیده بگیرید.</p>
+                </div>
+            `
+        })
+    });
+    if (!resp.ok) {
+        const errBody = await resp.text().catch(() => '');
+        throw new Error(`ارسال ایمیل ناموفق بود: ${errBody}`);
+    }
 }
 
 module.exports = async function handler(req, res) {
@@ -58,41 +120,33 @@ module.exports = async function handler(req, res) {
 
     const action = req.query?.action;
     const email = normalizeEmail(req.body?.email);
-    const password = String(req.body?.password || '');
+    const deviceId = normalizeDeviceId(req.body?.deviceId);
 
     if (!isValidEmailShape(email)) {
         return res.status(400).json({ error: 'فرمت ایمیل معتبر نیست.' });
     }
-    if (password.length < 6) {
-        return res.status(400).json({ error: 'پسورد باید حداقل ۶ کاراکتر باشد.' });
-    }
 
     try {
         if (action === 'register') {
+            const password = String(req.body?.password || '');
+            if (password.length < 6) {
+                return res.status(400).json({ error: 'پسورد باید حداقل ۶ کاراکتر باشد.' });
+            }
+
             const existingResp = await supaFetch(`users?email=eq.${encodeURIComponent(email)}&select=email`);
             const existing = await existingResp.json();
             if (Array.isArray(existing) && existing.length) {
                 return res.status(409).json({ error: 'این ایمیل قبلاً ثبت شده. اگر خودتی، وارد شو.' });
             }
 
-            // FIX: هزینه‌ی هش (salt rounds) روی ۱۰ گذاشته شده - تعادل استاندارد
-            // بین امنیت و سرعت برای این مقیاس کاربر.
             const passwordHash = await bcrypt.hash(password, 10);
-            const createUserResp = await supaFetch('users', {
-                method: 'POST',
-                body: JSON.stringify([{ email, password_hash: passwordHash, created_at: Date.now() }])
-            });
-            if (!createUserResp.ok) {
-                const errBody = await createUserResp.text().catch(() => '');
-                console.error('[auth] register insert failed:', errBody);
-                return res.status(500).json({ error: 'ثبت‌نام ناموفق بود.' });
-            }
-
-            const token = await createSession(email);
-            return res.status(200).json({ token, email });
+            await createAndSendCode({ email, purpose: 'register', passwordHash, deviceId });
+            return res.status(200).json({ needsVerification: true, purpose: 'register' });
         }
 
         if (action === 'login') {
+            const password = String(req.body?.password || '');
+
             const rowsResp = await supaFetch(`users?email=eq.${encodeURIComponent(email)}&select=password_hash`);
             const rows = await rowsResp.json();
             if (!Array.isArray(rows) || !rows.length) {
@@ -104,11 +158,83 @@ module.exports = async function handler(req, res) {
                 return res.status(401).json({ error: 'ایمیل یا پسورد اشتباه است.' });
             }
 
+            const isKnownDevice = deviceId ? await isDeviceKnown(email, deviceId) : false;
+            if (isKnownDevice) {
+                const token = await createSession(email);
+                return res.status(200).json({ token, email });
+            }
+
+            await createAndSendCode({ email, purpose: 'login', deviceId });
+            return res.status(200).json({ needsVerification: true, purpose: 'login' });
+        }
+
+        if (action === 'verify') {
+            const code = String(req.body?.code || '').trim();
+            const purpose = req.body?.purpose === 'register' ? 'register' : 'login';
+            if (!/^\d{6}$/.test(code)) {
+                return res.status(400).json({ error: 'کد باید ۶ رقم باشد.' });
+            }
+
+            const pending = await getLatestPending(email, purpose);
+            if (!pending) {
+                return res.status(400).json({ error: 'کد منقضی شده یا وجود ندارد. یک کد جدید بگیرید.' });
+            }
+            if (Date.now() > Number(pending.expires_at)) {
+                await deletePending(pending.id);
+                return res.status(400).json({ error: 'کد منقضی شده است. یک کد جدید بگیرید.' });
+            }
+            if (pending.attempts >= MAX_ATTEMPTS) {
+                await deletePending(pending.id);
+                return res.status(429).json({ error: 'تعداد تلاش‌های مجاز تمام شد. یک کد جدید بگیرید.' });
+            }
+
+            if (hashCode(code) !== pending.code_hash) {
+                await incrementAttempts(pending.id, pending.attempts);
+                return res.status(401).json({ error: 'کد نادرست است.' });
+            }
+
+            await deletePending(pending.id);
+
+            if (purpose === 'register') {
+                const createUserResp = await supaFetch('users', {
+                    method: 'POST',
+                    body: JSON.stringify([{ email, password_hash: pending.password_hash, created_at: Date.now() }])
+                });
+                if (!createUserResp.ok) {
+                    const errBody = await createUserResp.text().catch(() => '');
+                    console.error('[auth] register insert failed:', errBody);
+                    return res.status(500).json({ error: 'ثبت‌نام ناموفق بود.' });
+                }
+            }
+
+            if (deviceId) {
+                await rememberDevice(email, deviceId);
+            }
+
             const token = await createSession(email);
             return res.status(200).json({ token, email });
         }
 
-        return res.status(400).json({ error: 'action نامعتبر است (register یا login باشد).' });
+        if (action === 'resend-code') {
+            const purpose = req.body?.purpose === 'register' ? 'register' : 'login';
+            const pending = await getLatestPending(email, purpose);
+            if (pending && (Date.now() - Number(pending.created_at)) < RESEND_COOLDOWN_MS) {
+                return res.status(429).json({ error: 'کمی صبر کن و دوباره درخواست بده.' });
+            }
+            if (!pending) {
+                return res.status(400).json({ error: 'درخواست تاییدی برای این ایمیل پیدا نشد. دوباره از اول امتحان کن.' });
+            }
+            await deletePending(pending.id);
+            await createAndSendCode({
+                email,
+                purpose,
+                passwordHash: pending.password_hash || undefined,
+                deviceId: pending.device_id || deviceId
+            });
+            return res.status(200).json({ ok: true });
+        }
+
+        return res.status(400).json({ error: 'action نامعتبر است.' });
     } catch (err) {
         console.error('[auth] error:', err?.message || err);
         return res.status(500).json({ error: 'خطای داخلی سرور.' });
@@ -116,8 +242,6 @@ module.exports = async function handler(req, res) {
 };
 
 async function createSession(email) {
-    // FIX: توکن با crypto.randomBytes ساخته می‌شود - یعنی کاملاً تصادفی و
-    // غیرقابل‌حدس است (نه چیزی مشتق از ایمیل یا زمان که قابل پیش‌بینی باشد).
     const token = crypto.randomBytes(32).toString('hex');
     const now = Date.now();
     await supaFetch('sessions', {
@@ -125,4 +249,62 @@ async function createSession(email) {
         body: JSON.stringify([{ token, email, created_at: now, expires_at: now + SESSION_TTL_MS }])
     });
     return token;
+}
+
+async function createAndSendCode({ email, purpose, passwordHash, deviceId }) {
+    const code = generateCode();
+    const now = Date.now();
+    const insertResp = await supaFetch('pending_verifications', {
+        method: 'POST',
+        body: JSON.stringify([{
+            email,
+            code_hash: hashCode(code),
+            purpose,
+            password_hash: passwordHash || null,
+            device_id: deviceId || null,
+            attempts: 0,
+            created_at: now,
+            expires_at: now + CODE_TTL_MS
+        }])
+    });
+    if (!insertResp.ok) {
+        const errBody = await insertResp.text().catch(() => '');
+        throw new Error(`ثبت کد تایید ناموفق بود: ${errBody}`);
+    }
+    await sendVerificationEmail(email, code, purpose);
+}
+
+async function getLatestPending(email, purpose) {
+    const resp = await supaFetch(
+        `pending_verifications?email=eq.${encodeURIComponent(email)}&purpose=eq.${purpose}&order=created_at.desc&limit=1`
+    );
+    const rows = await resp.json();
+    return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
+async function deletePending(id) {
+    await supaFetch(`pending_verifications?id=eq.${id}`, { method: 'DELETE' });
+}
+
+async function incrementAttempts(id, currentAttempts) {
+    await supaFetch(`pending_verifications?id=eq.${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ attempts: currentAttempts + 1 })
+    });
+}
+
+async function isDeviceKnown(email, deviceId) {
+    const resp = await supaFetch(
+        `known_devices?email=eq.${encodeURIComponent(email)}&device_id=eq.${encodeURIComponent(deviceId)}&select=device_id`
+    );
+    const rows = await resp.json();
+    return Array.isArray(rows) && rows.length > 0;
+}
+
+async function rememberDevice(email, deviceId) {
+    await supaFetch('known_devices', {
+        method: 'POST',
+        headers: { 'Prefer': 'resolution=merge-duplicates' },
+        body: JSON.stringify([{ email, device_id: deviceId, created_at: Date.now() }])
+    });
 }
