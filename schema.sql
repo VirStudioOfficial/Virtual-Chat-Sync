@@ -44,3 +44,31 @@ create table if not exists chat_files (
     files jsonb,
     primary key (owner_email, chat_id)
 );
+
+-- کدهای تایید ایمیل (هم برای ثبت‌نام هم برای ورود از دستگاه جدید).
+-- کد به‌صورت هش‌شده ذخیره می‌شود، نه خام. برای register، پسورد هم به‌صورت
+-- هش‌شده موقتاً اینجا نگه داشته می‌شود تا کاربر واقعی فقط بعد از تایید
+-- کد در جدول users ساخته شود.
+create table if not exists pending_verifications (
+    id bigserial primary key,
+    email text not null,
+    code_hash text not null,
+    purpose text not null check (purpose in ('register', 'login')),
+    password_hash text,
+    device_id text,
+    attempts int not null default 0,
+    created_at bigint not null,
+    expires_at bigint not null
+);
+
+create index if not exists idx_pending_verifications_email
+    on pending_verifications(email, purpose);
+
+-- دستگاه‌هایی که قبلاً برای یک ایمیل تایید شده‌اند، تا هر بار لاگین از همان
+-- دستگاه دوباره کد نخواهیم.
+create table if not exists known_devices (
+    email text not null references users(email) on delete cascade,
+    device_id text not null,
+    created_at bigint not null,
+    primary key (email, device_id)
+);
