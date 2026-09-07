@@ -72,3 +72,24 @@ create table if not exists known_devices (
     created_at bigint not null,
     primary key (email, device_id)
 );
+
+-- FEATURE (dual-response A/B learning - مرحله ۴): هر بار کاربر بین دو
+-- پاسخ (الف/ب) یکی را انتخاب می‌کند، همین‌جا ذخیره می‌شود. بعداً
+-- api/preferences.js?action=analyze این جدول را می‌خواند و یک خلاصه‌ی
+-- کوتاه از الگوی ترجیح کاربر می‌سازد که به system prompt تزریق می‌شود
+-- (مرحله ۵) تا سبک کلی پاسخ‌ها با گذر زمان با سلیقه‌ی کاربر همسو شود.
+create table if not exists response_preferences (
+    id bigserial primary key,
+    owner_email text not null,
+    chat_id text not null,
+    user_message text not null,
+    response_a text not null,
+    response_b text not null,
+    chosen text not null check (chosen in ('a', 'b')),
+    response_a_meta jsonb,
+    response_b_meta jsonb,
+    created_at bigint not null
+);
+
+create index if not exists idx_response_preferences_owner
+    on response_preferences(owner_email, created_at desc);
