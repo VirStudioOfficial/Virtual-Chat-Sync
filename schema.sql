@@ -93,3 +93,21 @@ create table if not exists response_preferences (
 
 create index if not exists idx_response_preferences_owner
     on response_preferences(owner_email, created_at desc);
+
+-- FEATURE (حافظه‌ی بلندمدت کاربر): هر بار کاربر یک اطلاعات شخصی/دائمی
+-- (اسم، مدل کارت گرافیک، رنگ مورد علاقه، یا هر چیز دیگری که مدل مهم
+-- تشخیص دهد) می‌گوید، خودِ مدل در همان پاسخ یک بلاک widget-memory-save
+-- می‌سازد و کلاینت همان لحظه اینجا upsert می‌کند (نه با تأخیر/دوره‌ای).
+-- key آزاد است (نه از پیش تعریف‌شده) تا مدل بتواند هر برچسبی که مناسب
+-- می‌داند بسازد؛ (owner_email, key) کلید اصلی است تا مقدار جدید همیشه
+-- جایگزین مقدار قدیمی همان کلید شود، نه اینکه ردیف‌های تکراری بسازد.
+create table if not exists user_memory (
+    owner_email text not null,
+    key text not null,
+    value text not null,
+    updated_at bigint not null,
+    primary key (owner_email, key)
+);
+
+create index if not exists idx_user_memory_owner
+    on user_memory(owner_email);
