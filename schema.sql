@@ -111,3 +111,62 @@ create table if not exists user_memory (
 
 create index if not exists idx_user_memory_owner
     on user_memory(owner_email);
+
+-- ============================================================
+-- FEATURE: چت مشترک (دو یا چند نفر همزمان با هم و با ربات صحبت
+-- می‌کنند). این جدول‌ها را به schema.sql موجود اضافه کن (کپی/پیست
+-- در انتهای فایل کافی است، به هیچ جدول قبلی دست نمی‌زند).
+-- ============================================================
+
+-- هر چت مشترک یک رکورد این‌جا دارد. owner_email همان کسی است که چت را
+-- ساخته (سازنده)؛ invite_code کد کوتاهی است که برای دعوت نفر(های) بعدی
+-- به اشتراک گذاشته می‌شود.
+create table if not exists shared_chats (
+    chat_id text primary key,
+    owner_email text not null references users(email) on delete cascade,
+    title text not null default 'گفتگوی مشترک',
+    invite_code text not null unique,
+    created_at bigint not null,
+    updated_at bigint not null
+);
+
+create index if not exists idx_shared_chats_invite_code
+    on shared_chats(invite_code);
+
+-- عضوهای هر چت مشترک. سازنده هم موقع ساخت این‌جا اضافه می‌شود (پس این
+-- جدول همیشه منبع کامل و قابل‌اعتماد "چه کسانی عضو این چت‌اند" است).
+create table if not exists shared_chat_participants (
+    chat_id text not null references shared_chats(chat_id) on delete cascade,
+    email text not null references users(email) on delete cascade,
+    joined_at bigint not null,
+    primary key (chat_id, email)
+);
+
+create index if not exists idx_shared_chat_participants_email
+    on shared_chat_participants(email);
+
+-- خودِ پیام‌ها. برخلاف چت‌های شخصی (که history یک‌جا به‌صورت JSON در
+-- chat_history ذخیره می‌شود)، این‌جا هر پیام یک ردیف جداست چون چند نفر
+-- همزمان می‌نویسند و باید بشود «فقط پیام‌های جدیدتر از فلان id» را
+-- گرفت (برای polling کلاینت).
+create table if not exists shared_chat_messages (
+    id bigserial primary key,
+    chat_id text not null references shared_chats(chat_id) on delete cascade,
+    role text not null check (role in ('user', 'model')),
+    sender_email text, -- برای role='model' خالی می‌ماند
+    text text not null,
+    created_at bigint not null
+);
+
+create index if not exists idx_shared_chat_messages_chat_id
+    on shared_chat_messages(chat_id, id);
+
+-- قفل ساده برای جلوگیری از قاطی‌شدن دو پاسخ ربات هم‌زمان. وقتی پیامی
+-- در حال پردازش (در انتظار جواب Gemini) است، یک ردیف این‌جا می‌سازیم؛
+-- چون chat_id کلید اصلی است، تلاش دوم برای ساخت همزمان با خطای
+-- unique violation شکست می‌خورد و می‌فهمیم یکی دیگر مشغول است.
+create table if not exists shared_chat_locks (
+    chat_id text primary key references shared_chats(chat_id) on delete cascade,
+    locked_by text not null,
+    locked_at bigint not null
+);
