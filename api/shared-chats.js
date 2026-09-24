@@ -460,11 +460,45 @@ function isPermanentNoTextReason(reason) {
     return ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT'].some(r => value.includes(r));
 }
 
+// Gemini گاهی با نوبت‌های پشت‌سرهم از یک role (مثلاً دو نفر پشت هم پیام بدهند)
+// یا شروع با role=model خطای 400 می‌دهد؛ این تابع قبل از ارسال، contents را
+// تمیز می‌کند: نوبت‌های هم‌role مجاور ادغام و نوبت‌های model ابتدایی حذف می‌شوند.
+function normalizeGeminiContents(contents) {
+    const out = [];
+    for (const item of Array.isArray(contents) ? contents : []) {
+        if (!item || !Array.isArray(item.parts) || !item.parts.length) continue;
+        const role = item.role === 'model' ? 'model' : 'user';
+        const last = out[out.length - 1];
+        const hasFn = item.parts.some(p => p && (p.functionCall || p.functionResponse));
+        const lastHasFn = last && last.parts.some(p => p && (p.functionCall || p.functionResponse));
+        if (last && last.role === role && !hasFn && !lastHasFn) {
+            last.parts = [...last.parts, ...item.parts];
+        } else {
+            out.push({ ...item, role, parts: [...item.parts] });
+        }
+    }
+    while (out.length && out[0].role === 'model') out.shift();
+    return out;
+}
+
+// مثل pages/api/chat.js: thinking روی low (به‌جز flash-lite که thinkingConfig
+// را نمی‌پذیرد) + safetySettings. بدون این‌ها Gemini 3 پیش‌فرض thinking سنگین
+// دارد و با سقف ۴.۵ ثانیه‌ی هر تلاش، تایم‌اوت می‌شود.
 function buildGeminiRequestBody(contents, options = {}) {
     const includeTools = options.includeTools !== false && !options.searchUsed;
+    const modelName = options.modelName || '';
     return {
         system_instruction: { parts: [{ text: SHARED_CHAT_SYSTEM_TEXT }] },
-        contents,
+        contents: normalizeGeminiContents(contents),
+        safetySettings: [
+            { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_ONLY_HIGH' },
+            { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_ONLY_HIGH' },
+            { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_ONLY_HIGH' },
+            { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_ONLY_HIGH' }
+        ],
+        generationConfig: modelName === 'gemini-3.5-flash-lite'
+            ? {}
+            : { thinkingConfig: { thinkingLevel: 'low' } },
         ...(includeTools ? { tools: SHARED_GEMINI_TOOLS } : {})
     };
 }
@@ -583,7 +617,7 @@ async function runGeminiJsonRequest(contents, modelName, key, externalSignal, ti
                     'Content-Type': 'application/json',
                     'x-goog-api-key': key
                 },
-                body: JSON.stringify(buildGeminiRequestBody(contents, { includeTools })),
+                body: JSON.stringify(buildGeminiRequestBody(contents, { includeTools, modelName })),
                 signal: abort.controller.signal
             }
         );
@@ -735,7 +769,7 @@ async function getBotReply(historyForPrompt, model, externalSignal) {
         } catch (err) {
             if (externalSignal?.aborted) throw err;
             const classified = classifyGeminiError(err);
-            failures.push(`${geminiKeyLabel(geminiKeys, key)}: ${classified.category === 'timeout' ? 'timeout' : String(err?.message || err).slice(0, 180)}`);
+            failures.push(`${geminiKeyLabel(geminiKeys, key)}: ${classified.category === 'timeout' ? 'timeout' : (String(err?.message || err).slice(0, 80) + (err?.status ? ` HTTP ${err.status}` : '') + (err?.rawBody ? ` ${String(err.rawBody).slice(0, 280).replace(/\s+/g, ' ')}` : ''))}`);
             markGeminiKeyResult(key, false);
             // If a search already happened, the next key must use its result and may not call web_search again.
             if (searchState.used && searchState.result?.result) {
@@ -765,7 +799,7 @@ async function streamOneGeminiRound({ contents, modelName, key, externalSignal, 
                     'Content-Type': 'application/json',
                     'x-goog-api-key': key
                 },
-                body: JSON.stringify(buildGeminiRequestBody(contents, { includeTools })),
+                body: JSON.stringify(buildGeminiRequestBody(contents, { includeTools, modelName })),
                 signal: abort.controller.signal
             }
         );
@@ -1012,7 +1046,7 @@ async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, 
         } catch (err) {
             if (externalSignal?.aborted) return accumulatedAnswer.trim();
             const classified = classifyGeminiError(err);
-            failures.push(`${geminiKeyLabel(geminiKeys, key)}: ${classified.category === 'timeout' ? 'timeout' : String(err?.message || err).slice(0, 180)}`);
+            failures.push(`${geminiKeyLabel(geminiKeys, key)}: ${classified.category === 'timeout' ? 'timeout' : (String(err?.message || err).slice(0, 80) + (err?.status ? ` HTTP ${err.status}` : '') + (err?.rawBody ? ` ${String(err.rawBody).slice(0, 280).replace(/\s+/g, ' ')}` : ''))}`);
 
             // Never duplicate already-visible streamed text on a different key.
             if (accumulatedAnswer.trim()) {
