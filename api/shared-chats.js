@@ -476,10 +476,12 @@ function getTavilyKeys() {
     );
 }
 
+// نسخه‌ی دقیق‌تر از chat.js: «وب/ارز/now» فقط به‌صورت کلمه‌ی کامل (نه داخل «خوبی/ارزش/know») تا
+// پیام‌های معمولی الکی وارد حالت نگه‌داشتن متن (preamble hold) نشوند.
 function looksLikeWebSearchIntent(text) {
     const s = String(text || '').toLowerCase();
     if (!s.trim()) return false;
-    return /(?:سرچ|جستجو|گوگل|وب|اینترنت|قیمت(?:\s|‌)*(?:الان|امروز|فعلی|جدید|لحظه)|الان چنده|قیمتش|هزینه|آخرین|امروز|امشب|اخبار|خبرهای|آب[\u200c ]?وهوا|هوا(?:ی|\s)|نرخ|ارز|دلار|یورو|طلا|سهام|موجودی|current|latest|today|right now|now|search|google|look up|news|weather|price|stock|exchange rate|availability)/i.test(s);
+    return /(?:سرچ|جستجو|گوگل|(?<![آ-ی])وب(?![آ-ی])|اینترنت|قیمت(?:\s|‌)*(?:الان|امروز|فعلی|جدید|لحظه)|الان چنده|قیمتش|هزینه|آخرین|امروز|امشب|اخبار|خبرهای|آب[\u200c ]?وهوا|هوا(?:ی|\s)|نرخ|(?<![آ-ی])ارز(?![آ-ی])|دلار|یورو|طلا|سهام|موجودی|current|latest|today|right now|\\bnow\\b|search|google|look up|news|weather|price|stock|exchange rate|availability)/i.test(s);
 }
 
 function extractGeminiParts(data) {
@@ -1048,7 +1050,16 @@ async function streamBotReplyWithModel(historyForPrompt, model, onChunk, externa
     const modelName = model || DEFAULT_MODEL;
     const searchCache = new Map();
     const searchState = { used: false, result: null };
-    const searchIntent = looksLikeWebSearchIntent(historyForPrompt.map(x => (x?.parts || []).map(p => p?.text || '').join(' ')).join(' '));
+    // FIX (متن ربات بعضی وقت‌ها یک‌جا می‌آمد): قبلاً قصد جستجو از «کل تاریخچه‌ی ۱۰۰ پیامی»
+    // (شامل جواب‌های خود ربات) حساب می‌شد؛ کافی بود هر پیامی در آن پنجره کلمه‌ای مثل «امروز/قیمت/جدید»
+    // داشته باشد تا برای همه‌ی پاسخ‌های بعدی، متن تا ۱.۵ ثانیه نگه داشته شود (preamble hold) و
+    // یک‌جا بیاید. چت عادی (pages/api/chat.js) فقط پیام آخر کاربر را می‌سنجد؛ اینجا هم همان.
+    const lastUserTurn = [...historyForPrompt].reverse().find(x => x?.role === 'user');
+    const lastUserText = (lastUserTurn?.parts || [])
+        .map(p => p?.text || '')
+        .join(' ')
+        .replace(/^\[[^\]]*\]:\s*/, ''); // برچسب «[نام]:» جزو پیام نیست
+    const searchIntent = looksLikeWebSearchIntent(lastUserText);
     let accumulatedAnswer = '';
     let workingContents = [...historyForPrompt];
     let consecutiveUnavailable = 0;
@@ -1250,6 +1261,99 @@ async function releaseLock(chatId) {
     await supaFetch(`shared_chat_locks?chat_id=eq.${encodeURIComponent(chatId)}`, { method: 'DELETE' });
 }
 
+// ===== نام نمایشی به‌جای ایمیل =====
+// امنیت/حریم خصوصی: قبلاً سرور sender_email هر پیام را (ایمیل کامل!) برای همه‌ی
+// اعضا می‌فرستاد و ایمیل کامل سازنده هم در لیست چت‌ها بود؛ اپ فقط بخش قبل از @
+// را نشان می‌داد ولی کل ایمیل در پاسخ شبکه‌ بود. حالا هیچ ایمیلی به کلاینت
+// نمی‌رسد: هر پیام sender_name (نام نمایشی حساب) و is_mine دارد.
+// نام نمایشی همان چیزی است که اپ در حافظه‌ی حساب (user_memory) با کلید زیر ذخیره
+// می‌کند (نگاه کن به UserMemoryClient.ACCOUNT_NAME_KEY).
+const ACCOUNT_DISPLAY_NAME_KEY = '__vc_account_display_name';
+
+function toPersianDigits(n) {
+    return String(n).replace(/[0-9]/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]);
+}
+
+function sanitizeDisplayName(raw) {
+    const name = String(raw || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 40);
+    // اگر کاربر ایمیلش را به‌عنوان اسم گذاشته، همان را افشا نکن.
+    if (!name || name.includes('@')) return '';
+    return name;
+}
+
+// ایمیل‌ها -> {email: name}. اگر کسی اسم نداشت «کاربر N» (N = ترتیب عضویت در همین
+// چت)، و اگر دو نفر اسم یکسان داشتند، برای تفکیک شماره‌ی ترتیبی اضافه می‌شود.
+async function resolveDisplayNames(chatId, emails) {
+    const unique = [...new Set((emails || []).filter(Boolean).map(e => String(e).toLowerCase()))];
+    const names = {};
+    if (!unique.length) return names;
+
+    try {
+        const inList = unique.map(e => `"${e.replace(/"/g, '')}"`).join(',');
+        const resp = await supaFetch(
+            `user_memory?owner_email=in.(${encodeURIComponent(inList)})&key=eq.${ACCOUNT_DISPLAY_NAME_KEY}&select=owner_email,value`
+        );
+        const rows = resp.ok ? await resp.json() : [];
+        if (Array.isArray(rows)) {
+            for (const r of rows) {
+                const clean = sanitizeDisplayName(r.value);
+                if (clean) names[String(r.owner_email).toLowerCase()] = clean;
+            }
+        }
+    } catch (_) { /* بدون اسم: fallback پایین */ }
+
+    const needsFallback = unique.some(e => !names[e]);
+    const dupes = new Set();
+    {
+        const seen = new Set();
+        for (const e of unique) {
+            const n = names[e];
+            if (!n) continue;
+            if (seen.has(n)) dupes.add(n);
+            seen.add(n);
+        }
+    }
+    if (needsFallback || dupes.size) {
+        let order = [];
+        try {
+            const pResp = await supaFetch(
+                `shared_chat_participants?chat_id=eq.${encodeURIComponent(chatId)}&select=email&order=joined_at.asc`
+            );
+            const pRows = pResp.ok ? await pResp.json() : [];
+            order = Array.isArray(pRows) ? pRows.map(r => String(r.email).toLowerCase()) : [];
+        } catch (_) { /* ترتیب نامشخص */ }
+        for (const e of unique) {
+            const idx = order.indexOf(e);
+            const ordinal = toPersianDigits(idx >= 0 ? idx + 1 : unique.indexOf(e) + 1);
+            if (!names[e]) names[e] = `کاربر ${ordinal}`;
+            else if (dupes.has(names[e])) names[e] = `${names[e]} (${ordinal})`;
+        }
+    }
+    return names;
+}
+
+// پیام‌ها را برای ارسال به کلاینت آماده می‌کند: بدون sender_email.
+async function presentMessages(chatId, messages, requesterEmail) {
+    const list = Array.isArray(messages) ? messages : [];
+    const senderEmails = list.filter(m => m && m.role === 'user' && m.sender_email).map(m => m.sender_email);
+    const names = await resolveDisplayNames(chatId, senderEmails);
+    const me = String(requesterEmail || '').toLowerCase();
+    return list.map(m => {
+        if (!m) return m;
+        const { sender_email, ...rest } = m;
+        const senderLower = sender_email ? String(sender_email).toLowerCase() : '';
+        return {
+            ...rest,
+            sender_name: m.role === 'user' && senderLower ? (names[senderLower] || 'کاربر') : null,
+            is_mine: m.role === 'user' && !!senderLower && senderLower === me
+        };
+    });
+}
+
+async function presentMessage(chatId, message, requesterEmail) {
+    return (await presentMessages(chatId, [message], requesterEmail))[0];
+}
+
 async function insertMessage(chatId, role, senderEmail, text) {
     const resp = await supaFetch('shared_chat_messages', {
         method: 'POST',
@@ -1323,7 +1427,7 @@ module.exports = async function handler(req, res) {
                 const list = Array.isArray(messages) ? messages : [];
                 const attMap = await fetchAttachmentsForMessages(list.map(m => m.id));
                 for (const m of list) m.attachments = attMap[m.id] || [];
-                return res.status(200).json({ messages: list });
+                return res.status(200).json({ messages: await presentMessages(chatId, list, email) });
             }
 
             // لیست چت‌هایی که کاربر عضوشان است - از participants شروع
@@ -1342,7 +1446,12 @@ module.exports = async function handler(req, res) {
                 `shared_chats?chat_id=in.(${idsFilter})&select=chat_id,title,owner_email,invite_code,model,updated_at&order=updated_at.desc`
             );
             const chats = await chatsResp.json();
-            return res.status(200).json({ items: Array.isArray(chats) ? chats : [] });
+            // ایمیل سازنده را برای اعضا نفرست؛ فقط بگو «این کاربر سازنده است یا نه».
+            const items = (Array.isArray(chats) ? chats : []).map(({ owner_email, ...c }) => ({
+                ...c,
+                is_owner: String(owner_email || '').toLowerCase() === email
+            }));
+            return res.status(200).json({ items });
         }
 
         if (req.method !== 'POST') {
@@ -1603,7 +1712,7 @@ module.exports = async function handler(req, res) {
                 // این کاربر ذخیره شده و در نوبت polling بعدی هم دیده
                 // می‌شود، ولی این درخواست خودش منتظر جواب ربات نمی‌ماند -
                 // کلاینت با همان polling معمولی جواب را می‌بیند وقتی آماده شود.
-                return res.status(200).json({ message: userMsg, botPending: true });
+                return res.status(200).json({ message: await presentMessage(chatId, userMsg, email), botPending: true });
             }
 
             try {
@@ -1613,6 +1722,8 @@ module.exports = async function handler(req, res) {
                 const historyRowsDesc = await historyResp.json();
                 // از جدید به قدیم گرفتیم (تا limit روی «آخرین ۱۰۰ پیام» اعمال شود)؛ برای prompt برعکس می‌کنیم.
                 const historyRows = Array.isArray(historyRowsDesc) ? historyRowsDesc.reverse() : [];
+                // به‌جای ایمیل، نام نمایشی در پرامپت (تا مدل ایمیل کسی را در جواب لو ندهد).
+                const promptNames = await resolveDisplayNames(chatId, historyRows.map(r => r.sender_email));
 
                 // عکس‌های این پیام‌ها را یک‌جا بگیر و فقط MAX_IMAGES_TO_BOT تای آخر را
                 // واقعاً برای ربات بفرست (بقیه در متن با یک نشانه‌ی «[عکس]» می‌آیند).
@@ -1626,7 +1737,7 @@ module.exports = async function handler(req, res) {
                 const historyForPrompt = [];
                 for (const row of historyRows) {
                     const parts = [];
-                    const label = row.role === 'user' && row.sender_email ? `[${row.sender_email}]: ` : '';
+                    const label = row.role === 'user' && row.sender_email ? `[${promptNames[String(row.sender_email).toLowerCase()] || 'کاربر'}]: ` : '';
                     const rowAtts = attMap[row.id] || [];
                     const bodyText = (row.text || '') + (rowAtts.length && !row.text ? '(عکس فرستاده شد)' : '');
                     parts.push({ text: `${label}${bodyText}` });
@@ -1654,13 +1765,13 @@ module.exports = async function handler(req, res) {
                 });
 
                 if (botMsg) botMsg.attachments = [];
-                return res.status(200).json({ message: userMsg, botMessage: botMsg });
+                return res.status(200).json({ message: await presentMessage(chatId, userMsg, email), botMessage: await presentMessage(chatId, botMsg, email) });
             } catch (err) {
                 console.error('[shared-chats] bot reply failed:', err?.message || err);
                 // پیام کاربر خودش با موفقیت ذخیره شده؛ فقط جواب ربات نرسید -
                 // این را جدا اعلام می‌کنیم تا کلاینت پیام کاربر را از دست
                 // ندهد، فقط بگوید «ربات جواب نداد، دوباره امتحان کن».
-                return res.status(502).json({ message: userMsg, error: 'پاسخ ربات دریافت نشد.' });
+                return res.status(502).json({ message: await presentMessage(chatId, userMsg, email), error: 'پاسخ ربات دریافت نشد.' });
             } finally {
                 await releaseLock(chatId);
             }
@@ -1784,7 +1895,7 @@ module.exports = async function handler(req, res) {
             // اولین event: پیام کاربر (با id واقعی سرور) - کلاینت این را
             // فوری جایگزین نسخه‌ی optimistic خودش می‌کند، دقیقاً مثل چیزی
             // که قبلاً از فیلد "message" در پاسخ غیر-استریمی می‌خواند.
-            sendEvent({ userMessage: userMsg });
+            sendEvent({ userMessage: await presentMessage(chatId, userMsg, email) });
 
             const gotLock = await acquireLock(chatId, email);
             if (!gotLock) {
@@ -1798,6 +1909,8 @@ module.exports = async function handler(req, res) {
                 );
                 const historyRowsDesc = await historyResp.json();
                 const historyRows = Array.isArray(historyRowsDesc) ? historyRowsDesc.reverse() : [];
+                // به‌جای ایمیل، نام نمایشی در پرامپت (تا مدل ایمیل کسی را در جواب لو ندهد).
+                const promptNames = await resolveDisplayNames(chatId, historyRows.map(r => r.sender_email));
 
                 const attMap = await fetchAttachmentsForMessages(historyRows.map(r => r.id));
                 const allImages = [];
@@ -1809,7 +1922,7 @@ module.exports = async function handler(req, res) {
                 const historyForPrompt = [];
                 for (const row of historyRows) {
                     const parts = [];
-                    const label = row.role === 'user' && row.sender_email ? `[${row.sender_email}]: ` : '';
+                    const label = row.role === 'user' && row.sender_email ? `[${promptNames[String(row.sender_email).toLowerCase()] || 'کاربر'}]: ` : '';
                     const rowAtts = attMap[row.id] || [];
                     const bodyText = (row.text || '') + (rowAtts.length && !row.text ? '(عکس فرستاده شد)' : '');
                     parts.push({ text: `${label}${bodyText}` });
@@ -1848,7 +1961,7 @@ module.exports = async function handler(req, res) {
                 });
                 if (botMsg) botMsg.attachments = [];
                 if (!clientAbortController.signal.aborted) {
-                    sendEvent({ done: true, botMessage: botMsg });
+                    sendEvent({ done: true, botMessage: await presentMessage(chatId, botMsg, email) });
                     return res.end();
                 }
                 try { res.end(); } catch (_) {}
