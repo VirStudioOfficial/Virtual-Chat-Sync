@@ -170,3 +170,40 @@ create table if not exists shared_chat_locks (
     locked_by text not null,
     locked_at bigint not null
 );
+
+-- ============================================================
+-- FEATURE: عکس در چت مشترک + مدل ثابت برای هر چت مشترک
+-- (این بخش را هم در انتهای schema.sql / SQL Editor اجرا کن؛ همه‌ی
+-- دستورها idempotent هستند و به داده‌ی قبلی دست نمی‌زنند.)
+-- ============================================================
+
+-- مدل ثابت هر چت مشترک: سازنده موقع create انتخاب می‌کند و بعد از آن
+-- برای همه‌ی پاسخ‌های ربات در همان چت استفاده می‌شود. چت‌های قدیمی
+-- که قبل از این فیچر ساخته شده‌اند مقدار پیش‌فرض را می‌گیرند.
+alter table shared_chats
+    add column if not exists model text not null default 'gemini-3.6-flash';
+-- (default ستون عمداً همان مقدار قدیمی می‌ماند: چت‌های موجود همان مدلی را نگه می‌دارند که تا حالا عملاً استفاده می‌شد. چت‌های جدید مدل را از اپ می‌گیرند.)
+
+-- عکس‌های پیوست‌شده به پیام‌ها. عکس خودش در Supabase Storage
+-- (باکت chat-attachments) ذخیره می‌شود و اینجا فقط مسیرش + نوع فایل
+-- می‌ماند. به‌جای ستون جدا روی shared_chat_messages، یک جدول مستقل
+-- می‌سازیم تا یک پیام بتواند چند عکس داشته باشد و polling سبک بماند.
+create table if not exists shared_chat_attachments (
+    id bigserial primary key,
+    message_id bigint not null references shared_chat_messages(id) on delete cascade,
+    chat_id text not null references shared_chats(chat_id) on delete cascade,
+    storage_path text not null,
+    content_type text not null,
+    file_name text,
+    size_bytes bigint not null,
+    created_at bigint not null
+);
+
+create index if not exists idx_shared_chat_attachments_message
+    on shared_chat_attachments(message_id);
+create index if not exists idx_shared_chat_attachments_chat
+    on shared_chat_attachments(chat_id);
+
+-- پیام بدون متن (فقط عکس) هم مجاز است؛ قبلاً text باید not null غیرخالی
+-- می‌بود ولی ستون خودش فقط not null است (رشته‌ی خالی مجاز است)، پس
+-- نیازی به تغییر ندارد.
