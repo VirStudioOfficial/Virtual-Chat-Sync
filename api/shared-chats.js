@@ -40,7 +40,7 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const MAX_SHARED_CHATS_PER_USER = 50; // سقف امنیتی مشابه MAX_CHATS_PER_USER در api/chats.js
 const MAX_MESSAGE_CHARS = 8000;
 const MAX_MESSAGES_PER_POLL = 200;
-const LOCK_STALE_MS = 30 * 1000; // اگر قفل قدیمی‌تر از این بود، یعنی درخواست قبلی هنگ/کرش کرده - نادیده‌اش می‌گیریم
+const LOCK_STALE_MS = 90 * 1000; // اگر قفل قدیمی‌تر از این بود، یعنی درخواست قبلی هنگ/کرش کرده - نادیده‌اش می‌گیریم
 
 // ===== عکس در چت مشترک (Supabase Storage) =====
 // از همان باکت چت‌های شخصی استفاده می‌کنیم ولی زیر پیشوند جدا (shared/)
@@ -254,6 +254,42 @@ const SHARED_CHAT_SYSTEM_TEXT =
     'برای اطلاعات به‌روز، قیمت، اخبار، رویدادها یا چیزی که ممکن است بعد از زمان آموزش مدل تغییر کرده باشد، از ابزار web_search استفاده کن. برای سؤال ثابت و عمومی سرچ نکن. قبل از ابزار هیچ مقدمه‌ای برای کاربر نساز. برای هر سؤال معمولاً یک سرچ کافی است و سرچ تکراری فقط وقتی مجاز است که نتیجه‌ی اول واقعاً ناکافی/نامرتبط باشد.\n' +
     'هنگام پاسخ به گفتگوی مشترک، نتیجه‌ی سرچ را در پاسخ نهایی با زبان طبیعی و دقیق به کار ببر و لینک/منبع واقعی را از نتیجه‌ی ابزار حفظ کن.';
 
+// ===== هم‌راستاسازی پرامپت با pages/api/chat.js =====
+// chat.js پرامپت را برای هر درخواست می‌سازد (نام مدل + هویت + تاریخ روز + قانون
+// معرفی مدل)؛ چت مشترک قبلاً یک متن ثابت بود و مثلاً تاریخ امروز را نمی‌دانست،
+// برای همین جواب سؤال‌های زمانی/وب‌سرچ ضعیف‌تر از چت عادی بود.
+// نام‌ها همان چیزی‌اند که چیپ انتخاب مدل در اپ نشان می‌دهد (MainActivity modelOptions).
+const SHARED_MODEL_DISPLAY_NAMES = {
+    'gemini-3.5-flash-lite': 'Virtual Bot 1.1',
+    'gemini-3.6-flash': 'Virtual Bot 1.6',
+    'gemini-3.8-flash': 'Virtual Bot 1.7',
+    'gemini-3.1-pro-preview': 'Virtual Bot 1.3'
+};
+
+function buildSharedSystemText(modelName) {
+    const displayName = SHARED_MODEL_DISPLAY_NAMES[modelName] || 'Virtual Bot';
+    const now = new Date();
+    let jalaliDate = '';
+    let gregorianDate = '';
+    let tehranTime = '';
+    try {
+        jalaliDate = new Intl.DateTimeFormat('fa-IR-u-ca-persian', { timeZone: 'Asia/Tehran', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }).format(now);
+        gregorianDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tehran', year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+        tehranTime = new Intl.DateTimeFormat('fa-IR', { timeZone: 'Asia/Tehran', hour: '2-digit', minute: '2-digit' }).format(now);
+    } catch (_) { /* Intl بدون داده‌ی locale: تاریخ را نادیده بگیر */ }
+
+    const identity =
+        `\nهویت: نام این مدل ${displayName} است. فقط اگر کاربر همین الان مستقیم درباره‌ی مدل پرسید بگو «من ${displayName} هستم.»؛ ` +
+        'هرگز خودت را با نسخه‌ای دیگر یا Gemini معرفی نکن و نام سازنده/تیم نساز. ' +
+        'بدون پرسش مستقیم کاربر، معرفی مدل را در هیچ پاسخی نیاور.\n';
+    const dateContext = jalaliDate
+        ? `\nاطلاعات زمان واقعی؛ همیشه همین را ملاک بگیر:\nامروز: ${jalaliDate} (میلادی: ${gregorianDate})\n` +
+          `ساعت فعلی به وقت تهران: ${tehranTime}\n` +
+          'مهم: وقت تهران فقط برای تاریخ/روز هفته است، نه لزوماً ساعت واقعی کاربران.\n'
+        : '';
+    return SHARED_CHAT_SYSTEM_TEXT + identity + dateContext;
+}
+
 // ===== Gemini engine (Shared Chat) =====
 // این بخش موتور مشترک Gemini + وب‌سرچ را نگه می‌دارد؛ قابلیت‌های مربوط به
 // فایل/ویدیو/Live عمداً وارد Shared Chat نمی‌شوند.
@@ -277,6 +313,19 @@ const SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS = Math.min(
 );
 const SHARED_GEMINI_MIN_REMAINING_MS = 1200;
 const SHARED_TAVILY_TIMEOUT_MS = 5000;
+
+// ===== استریم: رفع قطع‌شدن وسط پاسخ =====
+// قبلاً یک تایمر ۴.۵ثانیه‌ای روی «کل عمر» استریم بود (نه فقط انتظار اولین
+// بایت)، پس هر پاسخی که بیشتر از چند ثانیه طول می‌کشید وسط جمله قطع و به‌عنوان
+// پاسخ کامل ذخیره می‌شد. حالا (مثل pages/api/chat.js): تایمر فقط تا اولین
+// chunk، بعد از آن نگهبان بی‌فعالیتی که با هر chunk ریست می‌شود، و اگر Gemini
+// اتصال را بدون finishReason ببندد، از همان نقطه ادامه‌ی پاسخ خواسته می‌شود.
+const SHARED_STREAM_FIRST_BYTE_TIMEOUT_MS = 12 * 1000;
+const SHARED_STREAM_IDLE_MS = 30 * 1000;
+const SHARED_MAX_STREAM_RECOVERIES = 2;
+const SHARED_CONTINUE_PROMPT =
+    '[ادامهٔ پاسخ پس از قطع ناقص استریم — داخلی] پاسخ قبلی در میانهٔ تولید متوقف شد. ' +
+    'دقیقاً از همان نقطه‌ای که متن قبلی تمام شده ادامه بده؛ هیچ بخشی از متن قبلی را تکرار نکن و مقدمه، عذرخواهی یا اشاره به قطع شدن ننویس.';
 const SHARED_SEARCH_PREAMBLE_HOLD_MS = 1500;
 
 const SHARED_GEMINI_TOOLS = [
@@ -492,7 +541,7 @@ function buildGeminiRequestBody(contents, options = {}) {
     const includeTools = options.includeTools !== false && !options.searchUsed;
     const modelName = options.modelName || '';
     return {
-        system_instruction: { parts: [{ text: SHARED_CHAT_SYSTEM_TEXT }] },
+        system_instruction: { parts: [{ text: buildSharedSystemText(modelName) }] },
         contents: normalizeGeminiContents(contents),
         safetySettings: [
             { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_ONLY_HIGH' },
@@ -796,6 +845,11 @@ async function getBotReply(historyForPrompt, model, externalSignal) {
 
 async function streamOneGeminiRound({ contents, modelName, key, externalSignal, timeoutMs, includeTools, onText, searchIntent }) {
     const abort = makeAbortController(externalSignal, timeoutMs);
+    let idleTimer = null;
+    const armIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => { try { abort.controller.abort(); } catch (_) {} }, SHARED_STREAM_IDLE_MS);
+    };
     try {
         const response = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:streamGenerateContent?alt=sse`,
@@ -900,31 +954,88 @@ async function streamOneGeminiRound({ contents, modelName, key, externalSignal, 
             }
         };
 
-        while (!streamDone) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            let match;
-            while ((match = buffer.search(/\r?\n\r?\n/)) !== -1) {
-                const separator = buffer.match(/\r?\n\r?\n/)[0];
-                const eventText = buffer.slice(0, match);
-                buffer = buffer.slice(match + separator.length);
-                handleEvent(eventText);
+        let interrupted = false;
+        let gotFirstChunk = false;
+        try {
+            while (!streamDone) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                if (!gotFirstChunk) {
+                    // اولین داده رسید: تایمر «انتظار اولین بایت» دیگر لازم نیست.
+                    gotFirstChunk = true;
+                    clearTimeout(abort.timeoutId);
+                }
+                armIdle();
+                buffer += decoder.decode(value, { stream: true });
+                let match;
+                while ((match = buffer.search(/\r?\n\r?\n/)) !== -1) {
+                    const separator = buffer.match(/\r?\n\r?\n/)[0];
+                    const eventText = buffer.slice(0, match);
+                    buffer = buffer.slice(match + separator.length);
+                    handleEvent(eventText);
+                }
             }
+            buffer += decoder.decode();
+            if (buffer.trim()) handleEvent(buffer);
+        } catch (readErr) {
+            if (preambleTimer) { clearTimeout(preambleTimer); preambleTimer = null; }
+            if (externalSignal?.aborted) throw readErr;
+            const hadText = accumulatedParts.some(p => typeof p.text === 'string' && p.text);
+            if (!hadText && !functionCall) throw readErr; // چیزی نرسیده: بگذار کلید بعدی امتحان شود
+            interrupted = true; // متن ناقص رسیده: به‌جای دور ریختن، برگردان تا ادامه خواسته شود
         }
-
-        buffer += decoder.decode();
-        if (buffer.trim()) handleEvent(buffer);
 
         if (preambleTimer) clearTimeout(preambleTimer);
         if (!functionCall && pendingPreamble) flushPending();
         return {
             text: accumulatedParts.filter(p => typeof p.text === 'string').map(p => p.text).join(''),
+            parts: accumulatedParts.filter(p => typeof p.text === 'string' && p.text),
             functionCall,
-            finishReason
+            finishReason,
+            interrupted
         };
     } finally {
+        if (idleTimer) clearTimeout(idleTimer);
         abort.cleanup();
+    }
+}
+
+// یک round استریم + ادامه‌ی خودکار اگر Gemini وسط پاسخ اتصال را بست.
+// «ناقص» یعنی متن رسیده ولی هیچ finishReason (STOP/MAX_TOKENS/...) نیامده.
+// در این حالت متن قبلی را به‌عنوان نوبت model و یک دستور «ادامه بده» به‌عنوان
+// نوبت user اضافه می‌کنیم؛ متن جدید مستقیم به ادامه‌ی همان پیام پخش می‌شود.
+async function streamRoundWithRecovery({ contents, modelName, key, externalSignal, firstByteTimeoutMs, includeTools, onText, searchIntent }) {
+    let workingContents = contents;
+    let combinedText = '';
+    for (let attempt = 0; ; attempt++) {
+        const round = await streamOneGeminiRound({
+            contents: workingContents,
+            modelName,
+            key,
+            externalSignal,
+            timeoutMs: firstByteTimeoutMs,
+            includeTools: attempt === 0 ? includeTools : false,
+            onText,
+            searchIntent: attempt === 0 ? searchIntent : false
+        });
+        combinedText += round.text;
+        if (round.functionCall) return { ...round, text: combinedText };
+
+        const incomplete = !round.finishReason && round.text.trim().length > 0;
+        if (!incomplete) return { ...round, text: combinedText };
+
+        if (attempt >= SHARED_MAX_STREAM_RECOVERIES || externalSignal?.aborted) {
+            console.error(`[shared-chats] stream incomplete after ${attempt} recoveries (model=${modelName}, chars=${combinedText.length}, interrupted=${round.interrupted})`);
+            const marker = '\n\n⚠️ پاسخ کامل نشد';
+            try { onText(marker); } catch (_) {}
+            return { ...round, text: combinedText + marker, finishReason: 'INCOMPLETE_STREAM' };
+        }
+        console.warn(`[shared-chats] stream cut without finishReason; continuing (attempt ${attempt + 1}/${SHARED_MAX_STREAM_RECOVERIES}, chars=${combinedText.length}, interrupted=${round.interrupted})`);
+        workingContents = [
+            ...workingContents,
+            { role: 'model', parts: round.parts },
+            { role: 'user', parts: [{ text: SHARED_CONTINUE_PROMPT }] }
+        ];
     }
 }
 
@@ -946,15 +1057,15 @@ async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, 
         const key = geminiKeys[keyIdx];
         const remainingBeforeAttempt = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
         if (remainingBeforeAttempt < SHARED_GEMINI_MIN_REMAINING_MS) break;
-        const timeoutMs = Math.min(SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS, Math.max(1000, remainingBeforeAttempt - 250));
+        const timeoutMs = Math.min(SHARED_STREAM_FIRST_BYTE_TIMEOUT_MS, Math.max(1000, remainingBeforeAttempt - 250));
 
         try {
-            const round = await streamOneGeminiRound({
+            const round = await streamRoundWithRecovery({
                 contents: workingContents,
                 modelName,
                 key,
                 externalSignal,
-                timeoutMs,
+                firstByteTimeoutMs: timeoutMs,
                 includeTools: !searchState.used,
                 onText: piece => {
                     accumulatedAnswer += piece;
@@ -1006,15 +1117,15 @@ async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, 
                 ];
 
                 const secondTimeout = Math.min(
-                    SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS,
+                    SHARED_STREAM_FIRST_BYTE_TIMEOUT_MS,
                     Math.max(1000, remainingAfterSearch - 250)
                 );
-                const secondRound = await streamOneGeminiRound({
+                const secondRound = await streamRoundWithRecovery({
                     contents: followupContents,
                     modelName,
                     key,
                     externalSignal,
-                    timeoutMs: secondTimeout,
+                    firstByteTimeoutMs: secondTimeout,
                     includeTools: false,
                     onText: piece => {
                         accumulatedAnswer += piece;
