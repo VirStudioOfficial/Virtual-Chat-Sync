@@ -53,415 +53,358 @@ const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif
 // چت پر از عکس، حجم درخواست به Gemini (و زمان پاسخ) بی‌رویه بالا می‌رود.
 const MAX_IMAGES_TO_BOT = 6;
 
-// ===== retry پاسخ ربات =====
-// کل بودجه باید از تایم‌اوت خواندن کلاینت (۳۰ثانیه در SharedChatApiClient) و
-// maxDuration تابع ورسل کمتر بماند، وگرنه کلاینت قطع می‌کند و پیام ربات بعداً
-// (بی‌صدا) می‌رسد.
+// ===== Gemini engine (اقتباس‌شده از معماری pages/api/chat.js) =====
+// Shared Chat به agent/toolهای چت شخصی نیاز ندارد، اما لایه‌ی ارتباط با Gemini
+// همان اصول را دارد: classify خطا، health-aware key rotation، deadline مشترک،
+// AbortController، retry هوشمند و model fallback.
 const MAX_ATTEMPTS_PER_KEY = 2;
-const BOT_PER_CALL_TIMEOUT_MS = 20 * 1000;
-const BOT_TOTAL_BUDGET_MS = 26 * 1000;
-const BOT_RETRY_DELAY_MS = 800;
+const BOT_PER_CALL_TIMEOUT_MS = 7000;
+const BOT_TOTAL_BUDGET_MIN_MS = 12000;
+const BOT_TOTAL_BUDGET_MAX_MS = 28000;
+const BOT_RETRY_DELAY_MS = 250;
 
 // ===== مدل ثابت هر چت مشترک =====
-// فقط مدل‌های این لیست پذیرفته می‌شوند تا کاربر نتواند یک رشته‌ی دلخواه
-// را داخل URL درخواست Gemini بنشاند. اگر مدل‌های موردنظرت فرق دارند،
-// فقط همین لیست را عوض کن (اولین مورد پیش‌فرض است).
-// همان سه مدلی که چیپ انتخاب مدل در اپ (MainActivity modelOptions) نشان
-// می‌دهد. gemini-3.6-flash هم نگه داشته شده چون چت‌های مشترکی که قبل از
-// این فیچر ساخته شده‌اند در دیتابیس همین مقدار را دارند (default ستون).
 const ALLOWED_MODELS = [
-    'gemini-3.8-flash',        // Virtual Bot 1.7 - پیش‌فرض اپ
-    'gemini-3.5-flash-lite',   // Virtual Bot 1.1
-    'gemini-3.1-pro-preview',  // Virtual Bot 1.3
-    'gemini-3.6-flash'         // قدیمی (سازگاری با چت‌های قبلی)
+    'gemini-3.8-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-pro-preview',
+    'gemini-3.6-flash'
 ];
 const DEFAULT_MODEL = 'gemini-3.8-flash';
 
-function setCors(res) {
-    res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+function getGeminiKeys() {
+    return (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '')
+        .split(',')
+        .map(k => k.trim())
+        .filter(Boolean);
 }
 
-// ===== همان الگوی api/chats.js: تأیید هویت با session token داخلی =====
-async function verifySessionToken(token) {
-    if (!token) return null;
-    try {
-        const resp = await supaFetch(`sessions?token=eq.${encodeURIComponent(token)}&select=email,expires_at`);
-        if (!resp.ok) return null;
-        const rows = await resp.json();
-        if (!Array.isArray(rows) || !rows.length) return null;
-        const session = rows[0];
-        if (Number(session.expires_at) < Date.now()) return null;
-        return String(session.email).toLowerCase();
-    } catch (err) {
-        console.error('[shared-chats] verifySessionToken threw:', err?.message || err);
-        return null;
+function classifyGeminiError(error) {
+    const status = Number(
+        error?.status ??
+        error?.error?.code ??
+        error?.body?.status ??
+        error?.body?.error?.code ??
+        0
+    ) || null;
+    const providerCode =
+        error?.error?.status ||
+        error?.body?.error?.status ||
+        error?.statusText ||
+        null;
+    const rawMessage = String(
+        error?.message ||
+        error?.error?.message ||
+        error?.body?.message ||
+        error?.body?.error?.message ||
+        ''
+    ).trim();
+    const normalized = `${providerCode || ''} ${rawMessage}`.toLowerCase();
+
+    if (error?.name === 'AbortError' || /timeout|timed out|deadline exceeded/.test(normalized)) {
+        return { category: 'timeout', retryable: true, keySpecific: false, status, providerCode, rawMessage };
     }
-}
-
-function getBearerToken(req) {
-    const header = req.headers['authorization'] || '';
-    const match = /^Bearer\s+(.+)$/i.exec(header);
-    return match ? match[1] : null;
-}
-
-async function supaFetch(path, options = {}) {
-    return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-        ...options,
-        headers: {
-            'apikey': SUPABASE_SERVICE_ROLE_KEY,
-            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-            'Content-Type': 'application/json',
-            ...(options.headers || {})
-        }
-    });
-}
-
-function generateChatId() {
-    return crypto.randomBytes(16).toString('hex');
-}
-
-// کد دعوت کوتاه و خوانا (بدون کاراکترهای شبیه‌به‌هم مثل 0/O یا 1/I).
-const INVITE_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-function generateInviteCode() {
-    let code = '';
-    for (let i = 0; i < 6; i++) {
-        code += INVITE_CODE_ALPHABET[crypto.randomInt(0, INVITE_CODE_ALPHABET.length)];
+    if (status === 429 || /resource_exhausted|quota|rate.?limit|too many requests/.test(normalized)) {
+        const quota = /free.?tier|daily.?quota|quota.?exceeded|exceeded your current quota/.test(normalized);
+        return {
+            category: quota ? 'quota_exhausted' : 'rate_limit',
+            retryable: true,
+            keySpecific: true,
+            status: status || 429,
+            providerCode,
+            rawMessage
+        };
     }
-    return code;
+    if (status === 401 || /api key|invalid.*key|unauthenticated|authentication/.test(normalized)) {
+        return { category: 'invalid_api_key', retryable: true, keySpecific: true, status: status || 401, providerCode, rawMessage };
+    }
+    if (status === 403 || /permission|forbidden|access denied|not authorized/.test(normalized)) {
+        return { category: 'permission_denied', retryable: true, keySpecific: true, status: status || 403, providerCode, rawMessage };
+    }
+    if (status === 404 || /model.*not found|not_found|unknown model/.test(normalized)) {
+        return { category: 'model_not_found', retryable: true, keySpecific: false, status: status || 404, providerCode, rawMessage };
+    }
+    if (status === 400 || /invalid argument|invalid request|bad request|malformed/.test(normalized)) {
+        return { category: 'invalid_request', retryable: false, keySpecific: false, status: status || 400, providerCode, rawMessage };
+    }
+    if (status === 413 || /too large|payload.*large|request.*size|token limit|context length/.test(normalized)) {
+        return { category: 'request_too_large', retryable: false, keySpecific: false, status: status || 413, providerCode, rawMessage };
+    }
+    if ((status >= 500 && status <= 599) || /service unavailable|internal server error|bad gateway|temporarily unavailable/.test(normalized)) {
+        return { category: 'provider_unavailable', retryable: true, keySpecific: false, status, providerCode, rawMessage };
+    }
+    if (error instanceof TypeError || /fetch failed|network|socket|econn|enotfound|connection/.test(normalized)) {
+        return { category: 'network_error', retryable: true, keySpecific: false, status, providerCode, rawMessage };
+    }
+    return { category: 'unknown_error', retryable: true, keySpecific: false, status, providerCode, rawMessage };
 }
 
-// بررسی می‌کند که این ایمیل واقعاً عضو این چت مشترک است؛ همه‌جا قبل از
-// خواندن/نوشتن صدا زده می‌شود چون این‌جا (برخلاف چت شخصی) مالکیت به
-// چند نفر تعلق دارد، نه فقط owner_email.
-async function isParticipant(chatId, email) {
-    const resp = await supaFetch(
-        `shared_chat_participants?chat_id=eq.${encodeURIComponent(chatId)}&email=eq.${encodeURIComponent(email)}&select=email`
+// Per-process health state; intentionally stores the key itself only in memory.
+// Nothing here is logged or persisted.
+const __sharedKeyFailureCounts = new Map();
+
+function rotateKeysByHealth(keys) {
+    const shuffled = keys
+        .map(k => ({ k, r: Math.random() }))
+        .sort((a, b) => a.r - b.r)
+        .map(x => x.k);
+    return shuffled.sort((a, b) =>
+        (__sharedKeyFailureCounts.get(a) || 0) - (__sharedKeyFailureCounts.get(b) || 0)
     );
-    if (!resp.ok) return false;
-    const rows = await resp.json();
-    return Array.isArray(rows) && rows.length > 0;
 }
 
-
-// ===== Storage helpers (Supabase Storage REST) =====
-// مسیر: shared/<chatId>/<timestamp>_<نام امن>. برخلاف چت شخصی، ایمیل
-// آپلودکننده در مسیر نیست چون دسترسی بر اساس عضویت در چت است، نه مالکیت.
-function sharedStoragePath(chatId, fileName) {
-    const safeName = String(fileName || 'image').replace(/[^\w.\-]+/g, '_').slice(0, 100);
-    const rand = crypto.randomBytes(4).toString('hex');
-    return `shared/${encodeURIComponent(chatId)}/${Date.now()}_${rand}_${safeName}`;
+function markKeyResult(key, ok) {
+    if (ok) __sharedKeyFailureCounts.set(key, 0);
+    else __sharedKeyFailureCounts.set(key, (__sharedKeyFailureCounts.get(key) || 0) + 1);
 }
 
-async function uploadToStorage(objectPath, buffer, contentType) {
-    return fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
-        method: 'POST',
-        headers: {
-            'apikey': SUPABASE_SERVICE_ROLE_KEY,
-            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-            'Content-Type': contentType || 'application/octet-stream',
-            'x-upsert': 'false'
-        },
-        body: buffer
-    });
+function keyLabel(keys, key) {
+    return `key#${keys.indexOf(key) + 1}/${keys.length}`;
 }
 
-async function downloadFromStorage(objectPath) {
-    return fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
-        headers: {
-            'apikey': SUPABASE_SERVICE_ROLE_KEY,
-            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
-        }
-    });
-}
-
-async function deleteFromStorage(objectPath) {
-    // best-effort: اگر پاک نشد، مشکلی برای کاربر پیش نمی‌آید (فقط یک فایل یتیم می‌ماند)
-    try {
-        await fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
-            method: 'DELETE',
-            headers: {
-                'apikey': SUPABASE_SERVICE_ROLE_KEY,
-                'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
-            }
-        });
-    } catch (_) { /* ignore */ }
-}
-
-// مدل ثابت این چت را از دیتابیس می‌خواند. اگر ستون/ردیف مشکل داشت یا مدل
-// دیگر در لیست مجاز نبود، به پیش‌فرض برمی‌گردیم تا چت از کار نیفتد.
-async function getChatModel(chatId) {
-    try {
-        const resp = await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}&select=model`);
-        if (!resp.ok) return DEFAULT_MODEL;
-        const rows = await resp.json();
-        const model = Array.isArray(rows) && rows[0] && rows[0].model;
-        return ALLOWED_MODELS.includes(model) ? model : DEFAULT_MODEL;
-    } catch (_) {
-        return DEFAULT_MODEL;
+function getModelFallbacks(model) {
+    const selected = ALLOWED_MODELS.includes(model) ? model : DEFAULT_MODEL;
+    const fallbacks = [selected];
+    if (selected === 'gemini-3.1-pro-preview') {
+        fallbacks.push('gemini-3.8-flash', 'gemini-3.5-flash-lite');
+    } else if (selected === 'gemini-3.8-flash' || selected === 'gemini-3.6-flash') {
+        fallbacks.push('gemini-3.5-flash-lite');
     }
+    return [...new Set(fallbacks)];
 }
 
-// عکس‌های چند پیام را یک‌جا می‌گیرد و به‌صورت map از message_id -> [attachment] برمی‌گرداند
-// (یک query برای کل batch، نه یک query به ازای هر پیام).
-async function fetchAttachmentsForMessages(messageIds) {
-    const map = {};
-    if (!messageIds.length) return map;
-    const resp = await supaFetch(
-        `shared_chat_attachments?message_id=in.(${messageIds.join(',')})&select=id,message_id,storage_path,content_type,file_name,size_bytes&order=id.asc`
+function getBotDeadlineMs(keyCount, modelCount = 1) {
+    // Unlike chat.js, Shared Chat's HTTP client historically expects a short
+    // response window. We therefore copy the architecture, but keep the
+    // deadline below that client ceiling. More keys/models get more budget,
+    // but never beyond BOT_TOTAL_BUDGET_MAX_MS.
+    const attempts = Math.max(1, keyCount * modelCount);
+    return Math.min(
+        BOT_TOTAL_BUDGET_MAX_MS,
+        Math.max(BOT_TOTAL_BUDGET_MIN_MS, 3500 + attempts * 1800)
     );
-    if (!resp.ok) return map;
-    const rows = await resp.json();
-    if (!Array.isArray(rows)) return map;
-    for (const row of rows) {
-        (map[row.message_id] = map[row.message_id] || []).push({
-            id: row.id,
-            path: row.storage_path,
-            contentType: row.content_type,
-            name: row.file_name,
-            size: row.size_bytes
-        });
-    }
-    return map;
 }
 
-// FEATURE (فیچر B - پرامپت بهتر): قبلاً این‌جا فقط ۴ خط بود (نه لحن، نه
-// قوانین قالب‌بندی/لیست، نه چیزی درباره‌ی شماره‌گذاری تودرتو) - برای همین
-// چت مشترک هم لحن خشک‌تری داشت و هم مشکل «بخش ۱، ۱، ۱» (تکرار شماره در
-// لیست‌های تودرتو) که مدل‌های کوچیک بدون راهنمایی صریح بهش دچار می‌شن.
-// این‌جا معادل خلاصه‌شده‌ی بخش «لحن» + «قالب‌بندی» از systemText اصلی
-// chat.js است (نگاه کن به pages/api/chat.js حدود خط ۵۳۶۴-۵۴۴۴)، نه کل
-// آن پرامپت ۲۹هزار کاراکتری (که شامل حافظه/ترجیحات/ویجت/SVG است و چت
-// مشترک فعلاً به هیچ‌کدام نیاز ندارد).
-const SHARED_CHAT_SYSTEM_TEXT =
-    'تو Virtual Bot هستی؛ دستیار هوش مصنوعی گرم، صمیمی و طبیعی به فارسی، مثل صحبت با یک دوست باهوش، نه متن خشک و رسمی.\n' +
-    'در این گفتگو ممکن است بیش از یک نفر با تو صحبت کند - هر پیام کاربر با نام فرستنده مشخص شده؛ ' +
-    'به هر نفر با توجه به کل زمینه‌ی گفتگو پاسخ بده، نه فقط آخرین پیام را جدا از بقیه در نظر بگیر. ' +
-    'اگر دو نفر همزمان موضوع‌های متفاوتی مطرح کرده‌اند، مشخص کن به کدام پیام/کدام فرد پاسخ می‌دهی.\n' +
-    'لحن: رسمی→محترمانه، دوستانه→صمیمی، شوخ→هم‌راستا. محاوره‌ای و روان باش؛ فقط عبارت‌های رایج و طبیعی فارسی. ' +
-    'سؤال ساده کوتاه جواب بده؛ موضوع پیچیده کامل و مرحله‌ای. جمله‌ی اول را طوری نساز که با پاسخ واقعی بعدی تناقض داشته باشد.\n' +
-    'ایموجی را مستقل از رفتار کاربر و طبیعی استفاده کن (لازم نیست کاربر اول ایموجی بزند)؛ در پاسخ‌های رسمی/فنی/جدی ایموجی کم یا اصلاً استفاده نکن؛ ' +
-    'هرگز 🤖 استفاده نکن و از ردیف طولانی ایموجی پرهیز کن.\n' +
-    'قالب‌بندی (فقط وقتی واقعاً لازم است): ایتالیک با *متن* یا _متن_؛ خط‌خورده با ~~متن~~؛ لینک واقعی با [متن](https://...)؛ ' +
-    'جدول مارک‌داون فقط برای داده‌ی واقعاً جدولی.\n' +
-    'قانون شماره‌گذاری لیست تودرتو (مهم): هر سطح فقط یک‌بار شماره/بولت بگیرد - هرگز ننویس «۱. بخش ۱» یا زیر آیتم شماره‌ی «۱» دوباره زیرشماره‌ی «۱.۱» را با پیشوند تکراری تکرار نکن؛ ' +
-    'برای زیرسطح از حروف (الف، ب) یا خط تیره‌ی ساده استفاده کن، نه تکرار همان عدد پدر. لیست تودرتو با ۲ فاصله برای هر سطح تورفتگی داشته باشد.\n' +
-    'ریاضی: درون‌خطی با $...$ و مستقل/بزرگ با $$...$$؛ علامت $ را escape نکن.\n' +
-    'درباره‌ی چیزهایی که نمی‌دانی اطلاعات ساختگی نده و بگو مطمئن نیستی.';
+function makeGeminiRequestBody(historyForPrompt) {
+    return {
+        systemInstruction: { parts: [{ text: SHARED_CHAT_SYSTEM_TEXT }] },
+        contents: historyForPrompt
+    };
+}
 
-// ===== پاسخ ربات: یک generateContent ساده (بدون استریم/ابزار) با
-// چرخش بین چند کلید API، دقیقاً هم‌الگو با تابع تولید عنوان در
-// chat.js. چت مشترک برای شروع نیازی به search/file-edit ندارد. =====
+function parseGeminiText(data) {
+    return data?.candidates?.[0]?.content?.parts?.map(p => p?.text || '').join('') || '';
+}
+
+function makeHttpGeminiError(status, bodyText) {
+    let parsed = null;
+    try { parsed = JSON.parse(bodyText); } catch (_) {}
+    const err = new Error(parsed?.error?.message || `HTTP ${status}`);
+    err.status = status;
+    err.statusText = parsed?.error?.status || null;
+    err.body = parsed;
+    return err;
+}
+
+function isPermanentEmptyReason(reason) {
+    return ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT'].some(x => String(reason || '').includes(x));
+}
+
 async function getBotReply(historyForPrompt, model) {
-    const geminiKeys = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '')
-        .split(',').map(k => k.trim()).filter(Boolean);
-    if (!geminiKeys.length) {
-        throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
-    }
+    const keys = getGeminiKeys();
+    if (!keys.length) throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
 
-    const systemText = SHARED_CHAT_SYSTEM_TEXT;
-
-    // هر کلید تا MAX_ATTEMPTS_PER_KEY بار امتحان می‌شود، ولی فقط برای خطاهای
-    // «گذرا» (429 / 5xx / تایم‌اوت / خطای شبکه). خطاهای دائمی (400 = درخواست
-    // خراب، 401/403 = کلید بد، 404 = مدل ناموجود) retry نمی‌شوند - تکرارشان
-    // فقط وقت تلف می‌کند. بودجه‌ی کل زمان هم محدود است تا از maxDuration
-    // ورسل (و تایم‌اوت ۳۰ثانیه‌ی کلاینت اندروید) رد نشویم.
+    const models = getModelFallbacks(model);
     const startedAt = Date.now();
-    const failures = []; // برای لاگ نهایی: چرا هر تلاش شکست خورد
-    const modelName = model || DEFAULT_MODEL;
+    const overallDeadline = startedAt + getBotDeadlineMs(keys.length, models.length);
+    const failures = [];
+    let lastError = null;
 
-    for (let keyIdx = 0; keyIdx < geminiKeys.length; keyIdx++) {
-        const key = geminiKeys[keyIdx];
-        for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_KEY; attempt++) {
-            const remaining = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
-            if (remaining < 3000) {
-                failures.push(`key#${keyIdx + 1}: بودجه‌ی زمانی تمام شد`);
-                break;
-            }
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), Math.min(BOT_PER_CALL_TIMEOUT_MS, remaining));
-            let retryable = false;
-            try {
-                const response = await fetch(
-                    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent`,
-                    {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-                        body: JSON.stringify({
-                            systemInstruction: { parts: [{ text: systemText }] },
-                            contents: historyForPrompt
-                        }),
-                        signal: controller.signal
+    outer:
+    for (const currentModel of models) {
+        const orderedKeys = rotateKeysByHealth(keys);
+        for (const currentKey of orderedKeys) {
+            if (Date.now() >= overallDeadline) break outer;
+            for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_KEY; attempt++) {
+                const remaining = Math.max(0, overallDeadline - Date.now());
+                if (remaining < 1000) break outer;
+
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), Math.min(BOT_PER_CALL_TIMEOUT_MS, remaining));
+                try {
+                    const response = await fetch(
+                        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(currentModel)}:generateContent`,
+                        {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'x-goog-api-key': currentKey
+                            },
+                            body: JSON.stringify(makeGeminiRequestBody(historyForPrompt)),
+                            signal: controller.signal
+                        }
+                    );
+                    if (!response.ok) {
+                        const body = await response.text().catch(() => '');
+                        const err = makeHttpGeminiError(response.status, body);
+                        const classified = classifyGeminiError(err);
+                        failures.push(`${keyLabel(keys, currentKey)} try${attempt}: HTTP ${response.status} ${body.slice(0, 240).replace(/\s+/g, ' ')}`);
+                        lastError = err;
+                        if (classified.keySpecific) markKeyResult(currentKey, false);
+                        if (!classified.retryable) break;
+                        continue;
                     }
-                );
 
-                if (!response.ok) {
-                    const errBody = await response.text().catch(() => '');
-                    // فقط ۳۰۰ کاراکتر اول، بدون کلید (خود پاسخ گوگل کلید را نشان نمی‌دهد)
-                    failures.push(`key#${keyIdx + 1} try${attempt}: HTTP ${response.status} ${errBody.slice(0, 300).replace(/\s+/g, ' ')}`);
-                    retryable = response.status === 429 || response.status >= 500;
-                } else {
                     const data = await response.json();
+                    const text = parseGeminiText(data).trim();
+                    if (text) {
+                        markKeyResult(currentKey, true);
+                        return text;
+                    }
+
                     const cand = data?.candidates?.[0];
-                    const text = cand?.content?.parts?.map(p => p?.text || '').join('').trim();
-                    if (text) return text;
-
-                    // جواب «موفق» ولی بدون متن: دلیلش را لاگ کن (SAFETY، MAX_TOKENS،
-                    // RECITATION، یا promptFeedback.blockReason). این‌ها retry نمی‌شوند
-                    // چون با همان ورودی همان نتیجه را می‌دهند.
-                    const why = cand?.finishReason
-                        || (data?.promptFeedback?.blockReason ? `prompt blocked: ${data.promptFeedback.blockReason}` : 'no candidates');
-                    failures.push(`key#${keyIdx + 1} try${attempt}: پاسخ بدون متن (${why})`);
-                    retryable = false;
+                    const reason = cand?.finishReason || (data?.promptFeedback?.blockReason ? `prompt blocked: ${data.promptFeedback.blockReason}` : 'no candidates');
+                    failures.push(`${keyLabel(keys, currentKey)} try${attempt}: پاسخ بدون متن (${reason})`);
+                    if (isPermanentEmptyReason(reason)) break;
+                    markKeyResult(currentKey, false);
+                } catch (err) {
+                    const classified = classifyGeminiError(err);
+                    failures.push(`${keyLabel(keys, currentKey)} try${attempt}: ${classified.category}${classified.rawMessage ? ` (${classified.rawMessage})` : ''}`);
+                    lastError = err;
+                    if (classified.keySpecific) markKeyResult(currentKey, false);
+                    if (!classified.retryable) break;
+                } finally {
+                    clearTimeout(timeoutId);
                 }
-            } catch (err) {
-                const aborted = err?.name === 'AbortError';
-                failures.push(`key#${keyIdx + 1} try${attempt}: ${aborted ? 'timeout' : (err?.message || err)}`);
-                retryable = true; // تایم‌اوت/شبکه گذراست
-            } finally {
-                clearTimeout(timeoutId);
-            }
 
-            if (!retryable) break; // خطای دائمی این کلید: برو سراغ کلید بعدی
-            if (attempt < MAX_ATTEMPTS_PER_KEY) {
-                await new Promise(r => setTimeout(r, BOT_RETRY_DELAY_MS * attempt)); // backoff ساده
+                if (attempt < MAX_ATTEMPTS_PER_KEY && Date.now() < overallDeadline) {
+                    await new Promise(resolve => setTimeout(resolve, BOT_RETRY_DELAY_MS * attempt));
+                }
             }
         }
     }
 
-    // یک خط لاگ کامل: مدل + دلیل هر تلاش. این همان چیزی است که قبلاً نبود و
-    // باعث می‌شد فقط «پاسخ دریافت نشد» ببینیم بدون اینکه بفهمیم چرا.
-    console.error(`[shared-chats] Gemini failed (model=${modelName}, ${Date.now() - startedAt}ms): ${failures.join(' | ') || 'no attempts'}`);
+    const classified = classifyGeminiError(lastError || new Error('Gemini deadline exceeded'));
+    console.error(
+        `[shared-chats] Gemini failed (models=${models.join(',')}, ${Date.now() - startedAt}ms, category=${classified.category}): ${failures.join(' | ') || 'no attempts'}`
+    );
     throw new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
 }
 
-// FEATURE (فیچر A - استریم): معادل استریمی getBotReply. با
-// streamGenerateContent?alt=sse (همون endpoint چت عادی chat.js) تماس
-// می‌گیرد و هر تکه‌ی متن رسیده را فوری با onChunk به بیرون می‌فرستد -
-// این‌طوری کاربر اولین کلمه را طی ~۱ ثانیه می‌بیند، نه بعد از ۵-۱۰ ثانیه
-// انتظار برای کل جواب (که تنها دلیل کندی محسوس چت مشترک نسبت به چت
-// عادی همین بود، نه Supabase/polling).
-// همان منطق retry/کلید چندگانه‌ی getBotReply این‌جا هم رعایت شده تا
-// افت پایداری نداشته باشیم.
 async function streamBotReply(historyForPrompt, model, onChunk) {
-    const geminiKeys = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '')
-        .split(',').map(k => k.trim()).filter(Boolean);
-    if (!geminiKeys.length) {
-        throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
-    }
+    const keys = getGeminiKeys();
+    if (!keys.length) throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
 
+    const models = getModelFallbacks(model);
     const startedAt = Date.now();
+    const overallDeadline = startedAt + getBotDeadlineMs(keys.length, models.length);
     const failures = [];
-    const modelName = model || DEFAULT_MODEL;
+    let lastError = null;
 
-    for (let keyIdx = 0; keyIdx < geminiKeys.length; keyIdx++) {
-        const key = geminiKeys[keyIdx];
-        for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_KEY; attempt++) {
-            const remaining = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
-            if (remaining < 3000) {
-                failures.push(`key#${keyIdx + 1}: بودجه‌ی زمانی تمام شد`);
-                break;
-            }
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), Math.min(BOT_PER_CALL_TIMEOUT_MS, remaining));
-            let retryable = false;
-            // FIX: اگر وسط استریم چند توکن واقعاً به کلاینت فرستاده شده
-            // باشد ولی خودِ اتصال قطع/ارور شود، دیگر نباید یک بار دیگر
-            // (روی کلید بعدی) از اول جواب بدهیم - کلاینت یک پاسخ نصفه با
-            // متن تکراری می‌بیند. پس اگر تا اینجا چیزی emit شده، به‌جای
-            // retryable=true، خطا را همون‌جا بالا می‌بریم.
-            let emittedAny = false;
-            try {
-                const response = await fetch(
-                    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:streamGenerateContent?alt=sse`,
-                    {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-                        body: JSON.stringify({
-                            systemInstruction: { parts: [{ text: SHARED_CHAT_SYSTEM_TEXT }] },
-                            contents: historyForPrompt
-                        }),
-                        signal: controller.signal
-                    }
-                );
+    outer:
+    for (const currentModel of models) {
+        const orderedKeys = rotateKeysByHealth(keys);
+        for (const currentKey of orderedKeys) {
+            if (Date.now() >= overallDeadline) break outer;
+            for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_KEY; attempt++) {
+                const remaining = Math.max(0, overallDeadline - Date.now());
+                if (remaining < 1000) break outer;
 
-                if (!response.ok) {
-                    const errBody = await response.text().catch(() => '');
-                    failures.push(`key#${keyIdx + 1} try${attempt}: HTTP ${response.status} ${errBody.slice(0, 300).replace(/\s+/g, ' ')}`);
-                    retryable = response.status === 429 || response.status >= 500;
-                } else {
-                    let fullText = '';
-                    let buffer = '';
-                    // FIX: بعضی وقت‌ها یک candidate بدون متن (finishReason
-                    // مثل SAFETY/RECITATION/MAX_TOKENS یا promptFeedback
-                    // بلاک‌شده) برمی‌گردد - قبلاً این حالت فقط پیام مبهم
-                    // «پاسخ استریم بدون متن» می‌داد بدون اینکه معلوم شود
-                    // چرا؛ حالا آخرین finishReason/blockReason دیده‌شده را
-                    // نگه می‌داریم تا در لاگ خطا مشخص باشد.
-                    let lastEmptyReason = null;
-                    // Node/Vercel: response.body یک async iterable از Buffer/Uint8Array است
-                    // (همون الگویی که خودِ chat.js برای پایپ‌کردن استریم Gemini استفاده می‌کند).
-                    for await (const rawChunk of response.body) {
-                        buffer += Buffer.isBuffer(rawChunk) ? rawChunk.toString('utf8') : String(rawChunk);
-                        // SSE: خط‌های "data: {...}" جدا با یک خط خالی. تا وقتی
-                        // یک بلوک کامل (پایان با \n\n) نداریم صبر می‌کنیم.
-                        let sepIdx;
-                        while ((sepIdx = buffer.indexOf('\n\n')) !== -1) {
-                            const rawEvent = buffer.slice(0, sepIdx);
-                            buffer = buffer.slice(sepIdx + 2);
-                            const line = rawEvent.split('\n').find(l => l.startsWith('data:'));
-                            if (!line) continue;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), Math.min(BOT_PER_CALL_TIMEOUT_MS, remaining));
+                let emittedAny = false;
+                let fullText = '';
+                let buffer = '';
+                let lastEmptyReason = null;
+
+                try {
+                    const response = await fetch(
+                        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(currentModel)}:streamGenerateContent?alt=sse`,
+                        {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'x-goog-api-key': currentKey
+                            },
+                            body: JSON.stringify(makeGeminiRequestBody(historyForPrompt)),
+                            signal: controller.signal
+                        }
+                    );
+
+                    if (!response.ok) {
+                        const body = await response.text().catch(() => '');
+                        const err = makeHttpGeminiError(response.status, body);
+                        const classified = classifyGeminiError(err);
+                        failures.push(`${keyLabel(keys, currentKey)} try${attempt}: HTTP ${response.status} ${body.slice(0, 240).replace(/\s+/g, ' ')}`);
+                        lastError = err;
+                        if (classified.keySpecific) markKeyResult(currentKey, false);
+                        if (!classified.retryable) break;
+                    } else {
+                        const processEvent = (rawEvent) => {
+                            const line = rawEvent.split(/\r?\n/).find(l => l.startsWith('data:'));
+                            if (!line) return;
                             const jsonStr = line.slice(5).trim();
-                            if (!jsonStr || jsonStr === '[DONE]') continue;
+                            if (!jsonStr || jsonStr === '[DONE]') return;
                             let parsed;
-                            try { parsed = JSON.parse(jsonStr); } catch (_) { continue; }
+                            try { parsed = JSON.parse(jsonStr); } catch (_) { return; }
                             const cand = parsed?.candidates?.[0];
                             const pieceText = cand?.content?.parts?.map(p => p?.text || '').join('') || '';
                             if (pieceText) {
                                 fullText += pieceText;
                                 emittedAny = true;
                                 onChunk(pieceText);
-                            } else {
-                                lastEmptyReason = cand?.finishReason
-                                    || (parsed?.promptFeedback?.blockReason ? `prompt blocked: ${parsed.promptFeedback.blockReason}` : lastEmptyReason);
+                            } else if (cand?.finishReason || parsed?.promptFeedback?.blockReason) {
+                                lastEmptyReason = cand?.finishReason || `prompt blocked: ${parsed.promptFeedback.blockReason}`;
+                            }
+                        };
+
+                        for await (const rawChunk of response.body) {
+                            buffer += Buffer.isBuffer(rawChunk) ? rawChunk.toString('utf8') : String(rawChunk);
+                            let sep;
+                            while ((sep = buffer.search(/\r?\n\r?\n/)) !== -1) {
+                                const rawEvent = buffer.slice(0, sep);
+                                const match = buffer.slice(sep).match(/^\r?\n\r?\n/);
+                                buffer = buffer.slice(sep + (match ? match[0].length : 2));
+                                processEvent(rawEvent);
                             }
                         }
-                    }
-                    if (fullText.trim()) return fullText;
-                    // FIX: قبلاً همیشه retryable=false بود، یعنی یک 503/۴۲۹
-                    // گذرا که تصادفاً یک استریم خالی برگردانده بود هم دیگر
-                    // روی همان کلید امتحان نمی‌شد. فقط دلایل دائمی (SAFETY،
-                    // RECITATION، بلاک شدن prompt) واقعاً retry نمی‌خواهند؛
-                    // بقیه (finishReason ناشناس یا هیچ‌کدام) را گذرا فرض کن.
-                    const permanentReasons = ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT'];
-                    const isPermanent = lastEmptyReason && permanentReasons.some(r => lastEmptyReason.includes(r));
-                    failures.push(`key#${keyIdx + 1} try${attempt}: پاسخ استریم بدون متن (${lastEmptyReason || 'دلیل نامشخص'})`);
-                    retryable = !isPermanent;
-                }
-            } catch (err) {
-                const aborted = err?.name === 'AbortError';
-                failures.push(`key#${keyIdx + 1} try${attempt}: ${aborted ? 'timeout' : (err?.message || err)}`);
-                if (emittedAny) {
-                    clearTimeout(timeoutId);
-                    // چیزی از قبل به کاربر رسیده - دیگر retry نکن، همون‌قدر که
-                    // رسیده را به‌عنوان جواب نهایی قبول کن تا چیزی گم/تکرار نشود.
-                    console.error(`[shared-chats] stream interrupted mid-way (model=${modelName}): ${err?.message || err}`);
-                    throw new Error('پاسخ ربات وسط راه قطع شد.');
-                }
-                retryable = true;
-            } finally {
-                clearTimeout(timeoutId);
-            }
+                        if (buffer.trim()) processEvent(buffer);
 
-            if (!retryable) break;
-            if (attempt < MAX_ATTEMPTS_PER_KEY) {
-                await new Promise(r => setTimeout(r, BOT_RETRY_DELAY_MS * attempt));
+                        if (fullText.trim()) {
+                            markKeyResult(currentKey, true);
+                            return fullText;
+                        }
+
+                        const reason = lastEmptyReason || 'دلیل نامشخص';
+                        failures.push(`${keyLabel(keys, currentKey)} try${attempt}: پاسخ استریم بدون متن (${reason})`);
+                        if (isPermanentEmptyReason(reason)) break;
+                        markKeyResult(currentKey, false);
+                    }
+                } catch (err) {
+                    const classified = classifyGeminiError(err);
+                    failures.push(`${keyLabel(keys, currentKey)} try${attempt}: ${classified.category}${classified.rawMessage ? ` (${classified.rawMessage})` : ''}`);
+                    lastError = err;
+                    if (emittedAny) {
+                        console.error(`[shared-chats] stream interrupted mid-way (model=${currentModel}, ${keyLabel(keys, currentKey)}): ${err?.message || err}`);
+                        throw new Error('پاسخ ربات وسط راه قطع شد.');
+                    }
+                    if (classified.keySpecific) markKeyResult(currentKey, false);
+                    if (!classified.retryable) break;
+                } finally {
+                    clearTimeout(timeoutId);
+                }
+
+                if (attempt < MAX_ATTEMPTS_PER_KEY && Date.now() < overallDeadline) {
+                    await new Promise(resolve => setTimeout(resolve, BOT_RETRY_DELAY_MS * attempt));
+                }
             }
         }
     }
 
-    console.error(`[shared-chats] Gemini stream failed (model=${modelName}, ${Date.now() - startedAt}ms): ${failures.join(' | ') || 'no attempts'}`);
+    const classified = classifyGeminiError(lastError || new Error('Gemini deadline exceeded'));
+    console.error(
+        `[shared-chats] Gemini stream failed (models=${models.join(',')}, ${Date.now() - startedAt}ms, category=${classified.category}): ${failures.join(' | ') || 'no attempts'}`
+    );
     throw new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
 }
 
