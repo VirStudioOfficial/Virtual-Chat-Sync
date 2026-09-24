@@ -1,681 +1,209 @@
-// api/shared-chats.js
-//
-// FEATURE: چت مشترک - دو (یا چند) کاربر لاگین‌شده همزمان با هم و با ربات
-// در یک گفتگو صحبت می‌کنند. کاملاً جدا از چت‌های شخصی (جدول‌های
-// chats/chat_history) است؛ اینجا جدول‌های shared_chats/
-// shared_chat_participants/shared_chat_messages/shared_chat_locks
-// استفاده می‌شود (نگاه کن به schema_additions.sql).
-//
-// امنیت مثل api/chats.js: کلاینت token را در Authorization می‌فرستد،
-// اینجا در جدول sessions بررسی و ایمیل معتبر آن استخراج می‌شود. کاربر
-// روی هیچ عملیاتی (خواندن/نوشتن پیام) دسترسی ندارد مگر واقعاً عضو
-// shared_chat_participants همان چت باشد - این چک همه‌جا تکرار می‌شود،
-// چون اینجا (برخلاف چت شخصی) owner_email به‌تنهایی کافی نیست، هر
-// عضوی (نه فقط سازنده) باید بتواند بخواند/بفرستد.
-//
-// GET  /api/shared-chats                                -> لیست چت‌های مشترکی که کاربر عضو آنهاست
-// GET  /api/shared-chats?chatId=..&since=<id>            -> پیام‌های جدیدتر از id داده‌شده (polling)
-// POST /api/shared-chats?action=create   body:{title?, model?} -> چت جدید + inviteCode (مدل فقط همین‌جا و توسط سازنده تعیین می‌شود)
-// POST /api/shared-chats?action=join     body:{inviteCode} -> عضو شدن با کد دعوت
-// POST /api/shared-chats?action=upload   body:{chatId,base64,contentType,name} -> آپلود یک عکس به Supabase Storage (فقط اعضا)
-// POST /api/shared-chats?action=send     body:{chatId,text?,attachments?:[{path}]} -> ارسال پیام (+عکس) + پاسخ Gemini
-// GET  /api/shared-chats?action=download&chatId=..&path=.. -> دانلود یک عکس (فقط اعضا؛ پاسخ: {base64,contentType})
-//
-// نیازمندی‌های محیطی: همان SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY پروژه
-// (نگاه کن به api/chats.js) + GEMINI_API_KEYS (یا GEMINI_API_KEY) برای
-// پاسخ ربات.
+-- schema.sql برای پروژه‌ی virtual-chat-sync
+-- این پروژه جایگزین کامل سیستم قبلی (که به Google OAuth وابسته بود) است:
+-- کاربر با ایمیل/پسورد خودش (نه گوگل) ثبت‌نام و لاگین می‌کند.
 
-const crypto = require('crypto');
+-- جدول کاربران: پسورد هرگز خام ذخیره نمی‌شود، فقط هش bcrypt آن.
+create table if not exists users (
+    email text primary key,
+    password_hash text not null,
+    created_at bigint not null
+);
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+-- جدول session: بعد از لاگین موفق، یک توکن تصادفی امن اینجا ذخیره می‌شود.
+-- کلاینت این توکن را (نه ایمیل/پسورد را) در هر درخواست بعدی می‌فرستد.
+create table if not exists sessions (
+    token text primary key,
+    email text not null references users(email) on delete cascade,
+    created_at bigint not null,
+    expires_at bigint not null
+);
 
-const MAX_SHARED_CHATS_PER_USER = 50; // سقف امنیتی مشابه MAX_CHATS_PER_USER در api/chats.js
-const MAX_MESSAGE_CHARS = 8000;
-const MAX_MESSAGES_PER_POLL = 200;
-const LOCK_STALE_MS = 30 * 1000; // اگر قفل قدیمی‌تر از این بود، یعنی درخواست قبلی هنگ/کرش کرده - نادیده‌اش می‌گیریم
+-- جدول‌های چت - دقیقاً همان ساختاری که در نسخه‌ی قبلی (وابسته به گوگل)
+-- استفاده می‌شد، فقط owner_email حالا به ایمیل داخلی (جدول users) اشاره
+-- می‌کند نه به ایمیل گوگل.
+create table if not exists chats (
+    owner_email text not null,
+    chat_id text not null,
+    title text not null default 'گفتگوی جدید',
+    html text not null default '',
+    pinned boolean not null default false,
+    updated_at bigint not null,
+    primary key (owner_email, chat_id)
+);
 
-// ===== عکس در چت مشترک (Supabase Storage) =====
-// از همان باکت چت‌های شخصی استفاده می‌کنیم ولی زیر پیشوند جدا (shared/)
-// تا هیچ تداخلی با مسیرهای <email>/<chatId>/... در api/chats.js نباشد.
-const STORAGE_BUCKET = 'chat-attachments';
-const MAX_UPLOAD_SIZE = 5 * 1024 * 1024;        // 5MB برای هر عکس (باکت رایگان 1GB است)
-const MAX_ATTACHMENTS_PER_MESSAGE = 4;
-const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
-// فقط عکس‌های این‌قدر پیام اخیر برای ربات فرستاده می‌شود؛ وگرنه با یک
-// چت پر از عکس، حجم درخواست به Gemini (و زمان پاسخ) بی‌رویه بالا می‌رود.
-const MAX_IMAGES_TO_BOT = 6;
+create table if not exists chat_history (
+    owner_email text not null,
+    chat_id text not null,
+    history jsonb,
+    primary key (owner_email, chat_id)
+);
 
-// ===== مدل ثابت هر چت مشترک =====
-// فقط مدل‌های این لیست پذیرفته می‌شوند تا کاربر نتواند یک رشته‌ی دلخواه
-// را داخل URL درخواست Gemini بنشاند. اگر مدل‌های موردنظرت فرق دارند،
-// فقط همین لیست را عوض کن (اولین مورد پیش‌فرض است).
-// همان سه مدلی که چیپ انتخاب مدل در اپ (MainActivity modelOptions) نشان
-// می‌دهد. gemini-3.6-flash هم نگه داشته شده چون چت‌های مشترکی که قبل از
-// این فیچر ساخته شده‌اند در دیتابیس همین مقدار را دارند (default ستون).
-const ALLOWED_MODELS = [
-    'gemini-3.8-flash',        // Virtual Bot 1.7 - پیش‌فرض اپ
-    'gemini-3.5-flash-lite',   // Virtual Bot 1.1
-    'gemini-3.1-pro-preview',  // Virtual Bot 1.3
-    'gemini-3.6-flash'         // قدیمی (سازگاری با چت‌های قبلی)
-];
-const DEFAULT_MODEL = 'gemini-3.8-flash';
+create table if not exists chat_files (
+    owner_email text not null,
+    chat_id text not null,
+    files jsonb,
+    primary key (owner_email, chat_id)
+);
 
-function setCors(res) {
-    res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-}
+-- کدهای تایید ایمیل (هم برای ثبت‌نام هم برای ورود از دستگاه جدید).
+-- کد به‌صورت هش‌شده ذخیره می‌شود، نه خام. برای register، پسورد هم به‌صورت
+-- هش‌شده موقتاً اینجا نگه داشته می‌شود تا کاربر واقعی فقط بعد از تایید
+-- کد در جدول users ساخته شود.
+create table if not exists pending_verifications (
+    id bigserial primary key,
+    email text not null,
+    code_hash text not null,
+    purpose text not null check (purpose in ('register', 'login')),
+    password_hash text,
+    device_id text,
+    attempts int not null default 0,
+    created_at bigint not null,
+    expires_at bigint not null
+);
 
-// ===== همان الگوی api/chats.js: تأیید هویت با session token داخلی =====
-async function verifySessionToken(token) {
-    if (!token) return null;
-    try {
-        const resp = await supaFetch(`sessions?token=eq.${encodeURIComponent(token)}&select=email,expires_at`);
-        if (!resp.ok) return null;
-        const rows = await resp.json();
-        if (!Array.isArray(rows) || !rows.length) return null;
-        const session = rows[0];
-        if (Number(session.expires_at) < Date.now()) return null;
-        return String(session.email).toLowerCase();
-    } catch (err) {
-        console.error('[shared-chats] verifySessionToken threw:', err?.message || err);
-        return null;
-    }
-}
+create index if not exists idx_pending_verifications_email
+    on pending_verifications(email, purpose);
 
-function getBearerToken(req) {
-    const header = req.headers['authorization'] || '';
-    const match = /^Bearer\s+(.+)$/i.exec(header);
-    return match ? match[1] : null;
-}
+-- دستگاه‌هایی که قبلاً برای یک ایمیل تایید شده‌اند، تا هر بار لاگین از همان
+-- دستگاه دوباره کد نخواهیم.
+create table if not exists known_devices (
+    email text not null references users(email) on delete cascade,
+    device_id text not null,
+    created_at bigint not null,
+    primary key (email, device_id)
+);
 
-async function supaFetch(path, options = {}) {
-    return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-        ...options,
-        headers: {
-            'apikey': SUPABASE_SERVICE_ROLE_KEY,
-            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-            'Content-Type': 'application/json',
-            ...(options.headers || {})
-        }
-    });
-}
+-- FEATURE (dual-response A/B learning - مرحله ۴): هر بار کاربر بین دو
+-- پاسخ (الف/ب) یکی را انتخاب می‌کند، همین‌جا ذخیره می‌شود. بعداً
+-- api/preferences.js?action=analyze این جدول را می‌خواند و یک خلاصه‌ی
+-- کوتاه از الگوی ترجیح کاربر می‌سازد که به system prompt تزریق می‌شود
+-- (مرحله ۵) تا سبک کلی پاسخ‌ها با گذر زمان با سلیقه‌ی کاربر همسو شود.
+create table if not exists response_preferences (
+    id bigserial primary key,
+    owner_email text not null,
+    chat_id text not null,
+    user_message text not null,
+    response_a text not null,
+    response_b text not null,
+    chosen text not null check (chosen in ('a', 'b')),
+    response_a_meta jsonb,
+    response_b_meta jsonb,
+    created_at bigint not null
+);
 
-function generateChatId() {
-    return crypto.randomBytes(16).toString('hex');
-}
+create index if not exists idx_response_preferences_owner
+    on response_preferences(owner_email, created_at desc);
 
-// کد دعوت کوتاه و خوانا (بدون کاراکترهای شبیه‌به‌هم مثل 0/O یا 1/I).
-const INVITE_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-function generateInviteCode() {
-    let code = '';
-    for (let i = 0; i < 6; i++) {
-        code += INVITE_CODE_ALPHABET[crypto.randomInt(0, INVITE_CODE_ALPHABET.length)];
-    }
-    return code;
-}
+-- FEATURE (حافظه‌ی بلندمدت کاربر): هر بار کاربر یک اطلاعات شخصی/دائمی
+-- (اسم، مدل کارت گرافیک، رنگ مورد علاقه، یا هر چیز دیگری که مدل مهم
+-- تشخیص دهد) می‌گوید، خودِ مدل در همان پاسخ یک بلاک widget-memory-save
+-- می‌سازد و کلاینت همان لحظه اینجا upsert می‌کند (نه با تأخیر/دوره‌ای).
+-- key آزاد است (نه از پیش تعریف‌شده) تا مدل بتواند هر برچسبی که مناسب
+-- می‌داند بسازد؛ (owner_email, key) کلید اصلی است تا مقدار جدید همیشه
+-- جایگزین مقدار قدیمی همان کلید شود، نه اینکه ردیف‌های تکراری بسازد.
+create table if not exists user_memory (
+    owner_email text not null,
+    key text not null,
+    value text not null,
+    updated_at bigint not null,
+    primary key (owner_email, key)
+);
 
-// بررسی می‌کند که این ایمیل واقعاً عضو این چت مشترک است؛ همه‌جا قبل از
-// خواندن/نوشتن صدا زده می‌شود چون این‌جا (برخلاف چت شخصی) مالکیت به
-// چند نفر تعلق دارد، نه فقط owner_email.
-async function isParticipant(chatId, email) {
-    const resp = await supaFetch(
-        `shared_chat_participants?chat_id=eq.${encodeURIComponent(chatId)}&email=eq.${encodeURIComponent(email)}&select=email`
-    );
-    if (!resp.ok) return false;
-    const rows = await resp.json();
-    return Array.isArray(rows) && rows.length > 0;
-}
+create index if not exists idx_user_memory_owner
+    on user_memory(owner_email);
 
+-- ============================================================
+-- FEATURE: چت مشترک (دو یا چند نفر همزمان با هم و با ربات صحبت
+-- می‌کنند). این جدول‌ها را به schema.sql موجود اضافه کن (کپی/پیست
+-- در انتهای فایل کافی است، به هیچ جدول قبلی دست نمی‌زند).
+-- ============================================================
 
-// ===== Storage helpers (Supabase Storage REST) =====
-// مسیر: shared/<chatId>/<timestamp>_<نام امن>. برخلاف چت شخصی، ایمیل
-// آپلودکننده در مسیر نیست چون دسترسی بر اساس عضویت در چت است، نه مالکیت.
-function sharedStoragePath(chatId, fileName) {
-    const safeName = String(fileName || 'image').replace(/[^\w.\-]+/g, '_').slice(0, 100);
-    const rand = crypto.randomBytes(4).toString('hex');
-    return `shared/${encodeURIComponent(chatId)}/${Date.now()}_${rand}_${safeName}`;
-}
+-- هر چت مشترک یک رکورد این‌جا دارد. owner_email همان کسی است که چت را
+-- ساخته (سازنده)؛ invite_code کد کوتاهی است که برای دعوت نفر(های) بعدی
+-- به اشتراک گذاشته می‌شود.
+create table if not exists shared_chats (
+    chat_id text primary key,
+    owner_email text not null references users(email) on delete cascade,
+    title text not null default 'گفتگوی مشترک',
+    invite_code text not null unique,
+    created_at bigint not null,
+    updated_at bigint not null
+);
 
-async function uploadToStorage(objectPath, buffer, contentType) {
-    return fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
-        method: 'POST',
-        headers: {
-            'apikey': SUPABASE_SERVICE_ROLE_KEY,
-            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-            'Content-Type': contentType || 'application/octet-stream',
-            'x-upsert': 'false'
-        },
-        body: buffer
-    });
-}
+create index if not exists idx_shared_chats_invite_code
+    on shared_chats(invite_code);
 
-async function downloadFromStorage(objectPath) {
-    return fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
-        headers: {
-            'apikey': SUPABASE_SERVICE_ROLE_KEY,
-            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
-        }
-    });
-}
+-- عضوهای هر چت مشترک. سازنده هم موقع ساخت این‌جا اضافه می‌شود (پس این
+-- جدول همیشه منبع کامل و قابل‌اعتماد "چه کسانی عضو این چت‌اند" است).
+create table if not exists shared_chat_participants (
+    chat_id text not null references shared_chats(chat_id) on delete cascade,
+    email text not null references users(email) on delete cascade,
+    joined_at bigint not null,
+    primary key (chat_id, email)
+);
 
-async function deleteFromStorage(objectPath) {
-    // best-effort: اگر پاک نشد، مشکلی برای کاربر پیش نمی‌آید (فقط یک فایل یتیم می‌ماند)
-    try {
-        await fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
-            method: 'DELETE',
-            headers: {
-                'apikey': SUPABASE_SERVICE_ROLE_KEY,
-                'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
-            }
-        });
-    } catch (_) { /* ignore */ }
-}
+create index if not exists idx_shared_chat_participants_email
+    on shared_chat_participants(email);
 
-// مدل ثابت این چت را از دیتابیس می‌خواند. اگر ستون/ردیف مشکل داشت یا مدل
-// دیگر در لیست مجاز نبود، به پیش‌فرض برمی‌گردیم تا چت از کار نیفتد.
-async function getChatModel(chatId) {
-    try {
-        const resp = await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}&select=model`);
-        if (!resp.ok) return DEFAULT_MODEL;
-        const rows = await resp.json();
-        const model = Array.isArray(rows) && rows[0] && rows[0].model;
-        return ALLOWED_MODELS.includes(model) ? model : DEFAULT_MODEL;
-    } catch (_) {
-        return DEFAULT_MODEL;
-    }
-}
+-- خودِ پیام‌ها. برخلاف چت‌های شخصی (که history یک‌جا به‌صورت JSON در
+-- chat_history ذخیره می‌شود)، این‌جا هر پیام یک ردیف جداست چون چند نفر
+-- همزمان می‌نویسند و باید بشود «فقط پیام‌های جدیدتر از فلان id» را
+-- گرفت (برای polling کلاینت).
+create table if not exists shared_chat_messages (
+    id bigserial primary key,
+    chat_id text not null references shared_chats(chat_id) on delete cascade,
+    role text not null check (role in ('user', 'model')),
+    sender_email text, -- برای role='model' خالی می‌ماند
+    text text not null,
+    created_at bigint not null
+);
 
-// عکس‌های چند پیام را یک‌جا می‌گیرد و به‌صورت map از message_id -> [attachment] برمی‌گرداند
-// (یک query برای کل batch، نه یک query به ازای هر پیام).
-async function fetchAttachmentsForMessages(messageIds) {
-    const map = {};
-    if (!messageIds.length) return map;
-    const resp = await supaFetch(
-        `shared_chat_attachments?message_id=in.(${messageIds.join(',')})&select=id,message_id,storage_path,content_type,file_name,size_bytes&order=id.asc`
-    );
-    if (!resp.ok) return map;
-    const rows = await resp.json();
-    if (!Array.isArray(rows)) return map;
-    for (const row of rows) {
-        (map[row.message_id] = map[row.message_id] || []).push({
-            id: row.id,
-            path: row.storage_path,
-            contentType: row.content_type,
-            name: row.file_name,
-            size: row.size_bytes
-        });
-    }
-    return map;
-}
+create index if not exists idx_shared_chat_messages_chat_id
+    on shared_chat_messages(chat_id, id);
 
-// ===== پاسخ ربات: یک generateContent ساده (بدون استریم/ابزار) با
-// چرخش بین چند کلید API، دقیقاً هم‌الگو با تابع تولید عنوان در
-// chat.js. چت مشترک برای شروع نیازی به search/file-edit ندارد. =====
-async function getBotReply(historyForPrompt, model) {
-    const geminiKeys = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '')
-        .split(',').map(k => k.trim()).filter(Boolean);
-    if (!geminiKeys.length) {
-        throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
-    }
+-- قفل ساده برای جلوگیری از قاطی‌شدن دو پاسخ ربات هم‌زمان. وقتی پیامی
+-- در حال پردازش (در انتظار جواب Gemini) است، یک ردیف این‌جا می‌سازیم؛
+-- چون chat_id کلید اصلی است، تلاش دوم برای ساخت همزمان با خطای
+-- unique violation شکست می‌خورد و می‌فهمیم یکی دیگر مشغول است.
+create table if not exists shared_chat_locks (
+    chat_id text primary key references shared_chats(chat_id) on delete cascade,
+    locked_by text not null,
+    locked_at bigint not null
+);
 
-    const systemText =
-        'تو Virtual Bot هستی؛ دستیار هوش مصنوعی گرم و صمیمی به فارسی. ' +
-        'در این گفتگو ممکن است بیش از یک نفر با تو صحبت کند - هر پیام با ' +
-        'نام فرستنده مشخص شده؛ به هر دو نفر با توجه به کل زمینه‌ی گفتگو ' +
-        'پاسخ بده، نه فقط آخرین پیام را جدا از بقیه در نظر بگیر.';
+-- ============================================================
+-- FEATURE: عکس در چت مشترک + مدل ثابت برای هر چت مشترک
+-- (این بخش را هم در انتهای schema.sql / SQL Editor اجرا کن؛ همه‌ی
+-- دستورها idempotent هستند و به داده‌ی قبلی دست نمی‌زنند.)
+-- ============================================================
 
-    for (const key of geminiKeys) {
-        try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 25000);
-            let response;
-            try {
-                response = await fetch(
-                    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model || DEFAULT_MODEL)}:generateContent`,
-                    {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-                        body: JSON.stringify({
-                            systemInstruction: { parts: [{ text: systemText }] },
-                            contents: historyForPrompt
-                        }),
-                        signal: controller.signal
-                    }
-                );
-            } finally {
-                clearTimeout(timeoutId);
-            }
+-- مدل ثابت هر چت مشترک: سازنده موقع create انتخاب می‌کند و بعد از آن
+-- برای همه‌ی پاسخ‌های ربات در همان چت استفاده می‌شود. چت‌های قدیمی
+-- که قبل از این فیچر ساخته شده‌اند مقدار پیش‌فرض را می‌گیرند.
+alter table shared_chats
+    add column if not exists model text not null default 'gemini-3.6-flash';
+-- (default ستون عمداً همان مقدار قدیمی می‌ماند: چت‌های موجود همان مدلی را نگه می‌دارند که تا حالا عملاً استفاده می‌شد. چت‌های جدید مدل را از اپ می‌گیرند.)
 
-            if (!response.ok) {
-                // کلید بعدی را امتحان کن؛ جزئیات دقیق خطای هر کلید برای این
-                // فیچر مهم نیست (برخلاف chat.js که کاربر مستقیم پیامش را
-                // می‌بیند، اینجا فقط اگر همه‌ی کلیدها شکست خوردند خطا می‌دهیم).
-                continue;
-            }
+-- عکس‌های پیوست‌شده به پیام‌ها. عکس خودش در Supabase Storage
+-- (باکت chat-attachments) ذخیره می‌شود و اینجا فقط مسیرش + نوع فایل
+-- می‌ماند. به‌جای ستون جدا روی shared_chat_messages، یک جدول مستقل
+-- می‌سازیم تا یک پیام بتواند چند عکس داشته باشد و polling سبک بماند.
+create table if not exists shared_chat_attachments (
+    id bigserial primary key,
+    message_id bigint not null references shared_chat_messages(id) on delete cascade,
+    chat_id text not null references shared_chats(chat_id) on delete cascade,
+    storage_path text not null,
+    content_type text not null,
+    file_name text,
+    size_bytes bigint not null,
+    created_at bigint not null
+);
 
-            const data = await response.json();
-            const text = data?.candidates?.[0]?.content?.parts?.map(p => p?.text || '').join('').trim();
-            if (text) return text;
-        } catch (_) {
-            continue;
-        }
-    }
+create index if not exists idx_shared_chat_attachments_message
+    on shared_chat_attachments(message_id);
+create index if not exists idx_shared_chat_attachments_chat
+    on shared_chat_attachments(chat_id);
 
-    throw new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
-}
-
-// قفل ساده روی chat_id: تلاش برای insert - چون chat_id همان‌جا primary
-// key است، دو تلاش هم‌زمان فقط یکی‌شان موفق می‌شود (رقابت واقعی روی
-// سطح دیتابیس حل می‌شود، نه فقط با چک‌کردن قبلی که خودش race دارد).
-async function acquireLock(chatId, byEmail) {
-    // قفل بیات (locked_at خیلی قدیمی) یعنی درخواست قبلی کرش/تایم‌اوت
-    // کرده؛ آزادش می‌کنیم تا این چت برای همیشه گیر نکند.
-    await supaFetch(
-        `shared_chat_locks?chat_id=eq.${encodeURIComponent(chatId)}&locked_at=lt.${Date.now() - LOCK_STALE_MS}`,
-        { method: 'DELETE' }
-    );
-
-    const resp = await supaFetch('shared_chat_locks', {
-        method: 'POST',
-        body: JSON.stringify([{ chat_id: chatId, locked_by: byEmail, locked_at: Date.now() }])
-    });
-    return resp.ok; // 201 یعنی قفل گرفته شد؛ 409 (unique violation) یعنی یکی دیگر مشغول است
-}
-
-async function releaseLock(chatId) {
-    await supaFetch(`shared_chat_locks?chat_id=eq.${encodeURIComponent(chatId)}`, { method: 'DELETE' });
-}
-
-async function insertMessage(chatId, role, senderEmail, text) {
-    const resp = await supaFetch('shared_chat_messages', {
-        method: 'POST',
-        headers: { 'Prefer': 'return=representation' },
-        body: JSON.stringify([{
-            chat_id: chatId,
-            role,
-            sender_email: senderEmail || null,
-            text,
-            created_at: Date.now()
-        }])
-    });
-    const rows = await resp.json().catch(() => null);
-    return Array.isArray(rows) && rows.length ? rows[0] : null;
-}
-
-module.exports = async function handler(req, res) {
-    setCors(res);
-
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
-
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-        return res.status(500).json({ error: 'سرور برای چت مشترک تنظیم نشده (SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY موجود نیست).' });
-    }
-
-    const email = await verifySessionToken(getBearerToken(req));
-    if (!email) {
-        return res.status(401).json({ error: 'ورود تأیید نشد. دوباره وارد شو.' });
-    }
-
-    try {
-        // ===== GET: لیست چت‌های مشترک کاربر، یا پیام‌های جدید یک چت =====
-        if (req.method === 'GET') {
-            const chatId = req.query?.chatId;
-
-            // ----- دانلود یک عکس: فقط اعضا، و فقط مسیری که واقعاً به همین چت ثبت شده -----
-            if (req.query?.action === 'download') {
-                const path = String(req.query?.path || '');
-                if (!chatId || !path) {
-                    return res.status(400).json({ error: 'chatId یا path مشخص نشده.' });
-                }
-                if (!(await isParticipant(chatId, email))) {
-                    return res.status(403).json({ error: 'عضو این گفتگوی مشترک نیستی.' });
-                }
-                // فقط پیشوند مسیر کافی نیست: مسیر باید دقیقاً در جدول ضمیمه‌ها برای
-                // همین chat_id ثبت شده باشد، وگرنه یک عضو می‌توانست مسیر یک چت دیگر را بخواهد.
-                const regResp = await supaFetch(
-                    `shared_chat_attachments?chat_id=eq.${encodeURIComponent(chatId)}&storage_path=eq.${encodeURIComponent(path)}&select=content_type`
-                );
-                const regRows = regResp.ok ? await regResp.json() : [];
-                if (!Array.isArray(regRows) || !regRows.length) {
-                    return res.status(404).json({ error: 'فایل پیدا نشد.' });
-                }
-                const storageResp = await downloadFromStorage(path);
-                if (!storageResp.ok) return res.status(404).json({ error: 'فایل پیدا نشد.' });
-                const base64 = Buffer.from(await storageResp.arrayBuffer()).toString('base64');
-                return res.status(200).json({ base64, contentType: regRows[0].content_type });
-            }
-
-            if (chatId) {
-                if (!(await isParticipant(chatId, email))) {
-                    return res.status(403).json({ error: 'عضو این گفتگوی مشترک نیستی.' });
-                }
-                const since = Number(req.query?.since) || 0;
-                const msgsResp = await supaFetch(
-                    `shared_chat_messages?chat_id=eq.${encodeURIComponent(chatId)}&id=gt.${since}&select=*&order=id.asc&limit=${MAX_MESSAGES_PER_POLL}`
-                );
-                const messages = await msgsResp.json();
-                const list = Array.isArray(messages) ? messages : [];
-                const attMap = await fetchAttachmentsForMessages(list.map(m => m.id));
-                for (const m of list) m.attachments = attMap[m.id] || [];
-                return res.status(200).json({ messages: list });
-            }
-
-            // لیست چت‌هایی که کاربر عضوشان است - از participants شروع
-            // می‌کنیم (نه از shared_chats) چون معیار دسترسی عضویت است، نه
-            // مالکیت.
-            const partResp = await supaFetch(
-                `shared_chat_participants?email=eq.${encodeURIComponent(email)}&select=chat_id`
-            );
-            const partRows = await partResp.json();
-            const chatIds = Array.isArray(partRows) ? partRows.map(r => r.chat_id) : [];
-            if (!chatIds.length) {
-                return res.status(200).json({ items: [] });
-            }
-            const idsFilter = chatIds.map(id => encodeURIComponent(id)).join(',');
-            const chatsResp = await supaFetch(
-                `shared_chats?chat_id=in.(${idsFilter})&select=chat_id,title,owner_email,invite_code,model,updated_at&order=updated_at.desc`
-            );
-            const chats = await chatsResp.json();
-            return res.status(200).json({ items: Array.isArray(chats) ? chats : [] });
-        }
-
-        if (req.method !== 'POST') {
-            return res.status(405).json({ error: 'متد پشتیبانی نمی‌شود.' });
-        }
-
-        const action = req.query?.action;
-
-        // ===== POST action=create: ساخت چت مشترک جدید =====
-        if (action === 'create') {
-            const countResp = await supaFetch(
-                `shared_chat_participants?email=eq.${encodeURIComponent(email)}&select=chat_id`,
-                { headers: { 'Prefer': 'count=exact' } }
-            );
-            const countHeader = countResp.headers.get('content-range');
-            const currentCount = countHeader ? parseInt(countHeader.split('/')[1], 10) || 0 : 0;
-            if (currentCount >= MAX_SHARED_CHATS_PER_USER) {
-                return res.status(403).json({ error: `حداکثر ${MAX_SHARED_CHATS_PER_USER} گفتگوی مشترک مجاز است.` });
-            }
-
-            const chatId = generateChatId();
-            const inviteCode = generateInviteCode();
-            const now = Date.now();
-            const title = String(req.body?.title || 'گفتگوی مشترک').slice(0, 200);
-
-            // مدل فقط اینجا (توسط سازنده) تعیین می‌شود و بعداً هیچ endpointی
-            // اجازه‌ی تغییرش را ندارد؛ مدل نامعتبر رد می‌شود (نه اینکه بی‌صدا
-            // جایگزین شود) تا کلاینت بفهمد چه اتفاقی افتاده.
-            const requestedModel = req.body?.model;
-            if (requestedModel !== undefined && requestedModel !== null && requestedModel !== '' &&
-                !ALLOWED_MODELS.includes(requestedModel)) {
-                return res.status(400).json({ error: 'مدل انتخاب‌شده معتبر نیست.', allowedModels: ALLOWED_MODELS });
-            }
-            const model = requestedModel || DEFAULT_MODEL;
-
-            const createResp = await supaFetch('shared_chats', {
-                method: 'POST',
-                body: JSON.stringify([{
-                    chat_id: chatId,
-                    owner_email: email,
-                    title,
-                    invite_code: inviteCode,
-                    model,
-                    created_at: now,
-                    updated_at: now
-                }])
-            });
-            if (!createResp.ok) {
-                const errBody = await createResp.text().catch(() => '');
-                console.error('[shared-chats] create failed:', errBody);
-                return res.status(500).json({ error: 'ساخت گفتگوی مشترک ناموفق بود.' });
-            }
-
-            await supaFetch('shared_chat_participants', {
-                method: 'POST',
-                body: JSON.stringify([{ chat_id: chatId, email, joined_at: now }])
-            });
-
-            return res.status(200).json({ chatId, inviteCode, title, model });
-        }
-
-        // ===== POST action=join: پیوستن با کد دعوت =====
-        if (action === 'join') {
-            const inviteCode = String(req.body?.inviteCode || '').trim().toUpperCase();
-            if (!inviteCode) {
-                return res.status(400).json({ error: 'کد دعوت مشخص نشده.' });
-            }
-
-            const findResp = await supaFetch(
-                `shared_chats?invite_code=eq.${encodeURIComponent(inviteCode)}&select=chat_id,title,model`
-            );
-            const findRows = await findResp.json();
-            if (!Array.isArray(findRows) || !findRows.length) {
-                return res.status(404).json({ error: 'کد دعوت معتبر نیست.' });
-            }
-            const chatId = findRows[0].chat_id;
-
-            // اگر قبلاً عضو بوده، دوباره اضافه کردن خطا نمی‌دهد (merge-duplicates)
-            // - یعنی می‌شود از کد دعوت هم برای join اول و هم به‌عنوان یک
-            // لینک دعوت قابل استفاده‌ی مکرر برای همان عضو استفاده کرد.
-            await supaFetch('shared_chat_participants', {
-                method: 'POST',
-                headers: { 'Prefer': 'resolution=merge-duplicates' },
-                body: JSON.stringify([{ chat_id: chatId, email, joined_at: Date.now() }])
-            });
-
-            return res.status(200).json({ chatId, title: findRows[0].title, model: findRows[0].model || DEFAULT_MODEL });
-        }
-
-        // ===== POST action=upload: آپلود یک عکس به Supabase Storage (فقط اعضا) =====
-        // آپلود جدا از send است تا بدنه‌ی send سبک بماند و اگر آپلود شکست خورد،
-        // پیام متنی کاربر گیر نکند. فایل تا وقتی همراه یک پیام send نشود
-        // در جدول ضمیمه‌ها ثبت نمی‌شود (پس برای بقیه‌ی اعضا نامرئی است).
-        if (action === 'upload') {
-            const chatId = String(req.body?.chatId || '').trim();
-            if (!chatId) {
-                return res.status(400).json({ error: 'chatId مشخص نشده.' });
-            }
-            if (!(await isParticipant(chatId, email))) {
-                return res.status(403).json({ error: 'عضو این گفتگوی مشترک نیستی.' });
-            }
-            const { base64, contentType, name } = req.body || {};
-            if (!base64 || typeof base64 !== 'string') {
-                return res.status(400).json({ error: 'محتوای عکس (base64) خالی است.' });
-            }
-            if (!ALLOWED_IMAGE_TYPES.includes(contentType)) {
-                return res.status(415).json({ error: 'فقط عکس (PNG، JPEG، WebP، GIF) مجاز است.' });
-            }
-            // پیشوند data:...;base64, اگر بود حذف می‌شود
-            const buffer = Buffer.from(base64.split(',').pop(), 'base64');
-            if (!buffer.length) {
-                return res.status(400).json({ error: 'محتوای عکس خالی یا نامعتبر است.' });
-            }
-            if (buffer.length > MAX_UPLOAD_SIZE) {
-                return res.status(413).json({ error: `حجم عکس بیشتر از ${MAX_UPLOAD_SIZE / (1024 * 1024)} مگابایت مجاز است.` });
-            }
-
-            const objectPath = sharedStoragePath(chatId, name);
-            const uploadResp = await uploadToStorage(objectPath, buffer, contentType);
-            if (!uploadResp.ok) {
-                const errText = await uploadResp.text().catch(() => '');
-                console.error('[shared-chats] uploadToStorage failed:', errText);
-                return res.status(502).json({ error: 'آپلود عکس روی Supabase Storage ناموفق بود.' });
-            }
-            return res.status(200).json({
-                ok: true,
-                path: objectPath,
-                contentType,
-                name: String(name || 'image').slice(0, 150),
-                size: buffer.length
-            });
-        }
-
-        // ===== POST action=send: ارسال پیام + پاسخ ربات =====
-        if (action === 'send') {
-            const chatId = String(req.body?.chatId || '').trim();
-            const text = String(req.body?.text || '').trim();
-            const rawAttachments = Array.isArray(req.body?.attachments) ? req.body.attachments : [];
-            if (!chatId || (!text && !rawAttachments.length)) {
-                return res.status(400).json({ error: 'chatId یا (text/attachments) مشخص نشده.' });
-            }
-            if (text.length > MAX_MESSAGE_CHARS) {
-                return res.status(413).json({ error: `پیام نباید بیشتر از ${MAX_MESSAGE_CHARS} کاراکتر باشد.` });
-            }
-            if (rawAttachments.length > MAX_ATTACHMENTS_PER_MESSAGE) {
-                return res.status(413).json({ error: `حداکثر ${MAX_ATTACHMENTS_PER_MESSAGE} عکس در هر پیام مجاز است.` });
-            }
-            if (!(await isParticipant(chatId, email))) {
-                return res.status(403).json({ error: 'عضو این گفتگوی مشترک نیستی.' });
-            }
-
-            // هر path باید همان چیزی باشد که خود همین چت در upload برگردانده:
-            // پیشوند shared/<chatId>/ اجباری است تا کسی نتواند فایل یک چت دیگر
-            // (یا فایل چت شخصی یک کاربر) را به پیام خودش وصل کند.
-            const requiredPrefix = `shared/${encodeURIComponent(chatId)}/`;
-            const validAttachments = [];
-            for (const att of rawAttachments) {
-                const path = String(att?.path || '');
-                if (!path.startsWith(requiredPrefix) || path.includes('..')) {
-                    return res.status(400).json({ error: 'مسیر عکس نامعتبر است.' });
-                }
-                // وجود فایل واقعی در Storage را تأیید کن (و نوع/حجم را از خود
-                // Storage بخوان، نه از ادعای کلاینت)
-                const headResp = await downloadFromStorage(path);
-                if (!headResp.ok) {
-                    return res.status(400).json({ error: 'یکی از عکس‌ها پیدا نشد؛ دوباره آپلودش کن.' });
-                }
-                const bytes = Buffer.from(await headResp.arrayBuffer());
-                const realType = (headResp.headers.get('content-type') || '').split(';')[0].trim();
-                if (!ALLOWED_IMAGE_TYPES.includes(realType) || bytes.length > MAX_UPLOAD_SIZE) {
-                    return res.status(400).json({ error: 'یکی از عکس‌ها نامعتبر است.' });
-                }
-                validAttachments.push({
-                    path,
-                    contentType: realType,
-                    name: String(att?.name || 'image').slice(0, 150),
-                    size: bytes.length
-                });
-            }
-
-            // پیام کاربر همیشه فوری ذخیره می‌شود (حتی اگر بعداً قفل جواب
-            // ربات را به تعویق بیندازد) - این‌طوری نفر دوم فوراً پیام
-            // نفر اول را در نتیجه‌ی polling بعدی می‌بیند، بدون نیاز به
-            // منتظر ماندن برای جواب ربات.
-            const userMsg = await insertMessage(chatId, 'user', email, text);
-            if (!userMsg) {
-                // فایل‌هایی که همین الان آپلود شده بودند دیگر به هیچ پیامی وصل نمی‌شوند؛ پاکشان کن.
-                await Promise.all(validAttachments.map(a => deleteFromStorage(a.path)));
-                return res.status(500).json({ error: 'ذخیره‌ی پیام ناموفق بود.' });
-            }
-            if (validAttachments.length) {
-                const attResp = await supaFetch('shared_chat_attachments', {
-                    method: 'POST',
-                    body: JSON.stringify(validAttachments.map(a => ({
-                        message_id: userMsg.id,
-                        chat_id: chatId,
-                        storage_path: a.path,
-                        content_type: a.contentType,
-                        file_name: a.name,
-                        size_bytes: a.size,
-                        created_at: Date.now()
-                    })))
-                });
-                if (!attResp.ok) {
-                    console.error('[shared-chats] attachments insert failed:', await attResp.text().catch(() => ''));
-                    // به‌جای اینکه پیام بدون عکس بماند (و کاربر فکر کند عکس رفته)،
-                    // پیام و فایل‌ها را برمی‌داریم و خطا برمی‌گردانیم تا کلاینت دوباره امتحان کند.
-                    await supaFetch(`shared_chat_messages?id=eq.${userMsg.id}`, { method: 'DELETE' });
-                    await Promise.all(validAttachments.map(a => deleteFromStorage(a.path)));
-                    return res.status(500).json({ error: 'ذخیره‌ی عکس‌ها ناموفق بود؛ دوباره امتحان کن.' });
-                }
-                userMsg.attachments = validAttachments.map(a => ({
-                    path: a.path, contentType: a.contentType, name: a.name, size: a.size
-                }));
-            } else {
-                userMsg.attachments = [];
-            }
-            await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}`, {
-                method: 'PATCH',
-                body: JSON.stringify({ updated_at: Date.now() })
-            });
-
-            const gotLock = await acquireLock(chatId, email);
-            if (!gotLock) {
-                // یکی دیگر همین الان دارد پیام قبلی را پردازش می‌کند؛ پیام
-                // این کاربر ذخیره شده و در نوبت polling بعدی هم دیده
-                // می‌شود، ولی این درخواست خودش منتظر جواب ربات نمی‌ماند -
-                // کلاینت با همان polling معمولی جواب را می‌بیند وقتی آماده شود.
-                return res.status(200).json({ message: userMsg, botPending: true });
-            }
-
-            try {
-                const historyResp = await supaFetch(
-                    `shared_chat_messages?chat_id=eq.${encodeURIComponent(chatId)}&select=id,role,sender_email,text&order=id.desc&limit=100`
-                );
-                const historyRowsDesc = await historyResp.json();
-                // از جدید به قدیم گرفتیم (تا limit روی «آخرین ۱۰۰ پیام» اعمال شود)؛ برای prompt برعکس می‌کنیم.
-                const historyRows = Array.isArray(historyRowsDesc) ? historyRowsDesc.reverse() : [];
-
-                // عکس‌های این پیام‌ها را یک‌جا بگیر و فقط MAX_IMAGES_TO_BOT تای آخر را
-                // واقعاً برای ربات بفرست (بقیه در متن با یک نشانه‌ی «[عکس]» می‌آیند).
-                const attMap = await fetchAttachmentsForMessages(historyRows.map(r => r.id));
-                const allImages = [];
-                for (const row of historyRows) {
-                    for (const att of (attMap[row.id] || [])) allImages.push({ msgId: row.id, att });
-                }
-                const sendableImages = new Set(allImages.slice(-MAX_IMAGES_TO_BOT).map(x => x.att.id));
-
-                const historyForPrompt = [];
-                for (const row of historyRows) {
-                    const parts = [];
-                    const label = row.role === 'user' && row.sender_email ? `[${row.sender_email}]: ` : '';
-                    const rowAtts = attMap[row.id] || [];
-                    const bodyText = (row.text || '') + (rowAtts.length && !row.text ? '(عکس فرستاده شد)' : '');
-                    parts.push({ text: `${label}${bodyText}` });
-
-                    for (const att of rowAtts) {
-                        if (!sendableImages.has(att.id)) {
-                            parts.push({ text: '[عکس قدیمی‌تر - برای صرفه‌جویی در حجم، دوباره فرستاده نشد]' });
-                            continue;
-                        }
-                        const imgResp = await downloadFromStorage(att.path);
-                        if (!imgResp.ok) continue;
-                        const b64 = Buffer.from(await imgResp.arrayBuffer()).toString('base64');
-                        parts.push({ inlineData: { mimeType: att.contentType, data: b64 } });
-                    }
-                    historyForPrompt.push({ role: row.role === 'model' ? 'model' : 'user', parts });
-                }
-
-                // مدل ثابت این چت (همان که سازنده موقع create انتخاب کرده)
-                const chatModel = await getChatModel(chatId);
-                const botText = await getBotReply(historyForPrompt, chatModel);
-                const botMsg = await insertMessage(chatId, 'model', null, botText);
-                await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}`, {
-                    method: 'PATCH',
-                    body: JSON.stringify({ updated_at: Date.now() })
-                });
-
-                if (botMsg) botMsg.attachments = [];
-                return res.status(200).json({ message: userMsg, botMessage: botMsg });
-            } catch (err) {
-                console.error('[shared-chats] bot reply failed:', err?.message || err);
-                // پیام کاربر خودش با موفقیت ذخیره شده؛ فقط جواب ربات نرسید -
-                // این را جدا اعلام می‌کنیم تا کلاینت پیام کاربر را از دست
-                // ندهد، فقط بگوید «ربات جواب نداد، دوباره امتحان کن».
-                return res.status(502).json({ message: userMsg, error: 'پاسخ ربات دریافت نشد.' });
-            } finally {
-                await releaseLock(chatId);
-            }
-        }
-
-        return res.status(400).json({ error: 'action نامعتبر است.' });
-    } catch (err) {
-        console.error('[shared-chats] handler error:', err?.message || err);
-        return res.status(500).json({ error: 'خطای داخلی سرور.', detail: err?.message || String(err) });
-    }
-};
+-- پیام بدون متن (فقط عکس) هم مجاز است؛ قبلاً text باید not null غیرخالی
+-- می‌بود ولی ستون خودش فقط not null است (رشته‌ی خالی مجاز است)، پس
+-- نیازی به تغییر ندارد.
