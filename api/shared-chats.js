@@ -47,6 +47,15 @@ const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif
 // چت پر از عکس، حجم درخواست به Gemini (و زمان پاسخ) بی‌رویه بالا می‌رود.
 const MAX_IMAGES_TO_BOT = 6;
 
+// ===== retry پاسخ ربات =====
+// کل بودجه باید از تایم‌اوت خواندن کلاینت (۳۰ثانیه در SharedChatApiClient) و
+// maxDuration تابع ورسل کمتر بماند، وگرنه کلاینت قطع می‌کند و پیام ربات بعداً
+// (بی‌صدا) می‌رسد.
+const MAX_ATTEMPTS_PER_KEY = 2;
+const BOT_PER_CALL_TIMEOUT_MS = 20 * 1000;
+const BOT_TOTAL_BUDGET_MS = 26 * 1000;
+const BOT_RETRY_DELAY_MS = 800;
+
 // ===== مدل ثابت هر چت مشترک =====
 // فقط مدل‌های این لیست پذیرفته می‌شوند تا کاربر نتواند یک رشته‌ی دلخواه
 // را داخل URL درخواست Gemini بنشاند. اگر مدل‌های موردنظرت فرق دارند،
@@ -227,14 +236,29 @@ async function getBotReply(historyForPrompt, model) {
         'نام فرستنده مشخص شده؛ به هر دو نفر با توجه به کل زمینه‌ی گفتگو ' +
         'پاسخ بده، نه فقط آخرین پیام را جدا از بقیه در نظر بگیر.';
 
-    for (const key of geminiKeys) {
-        try {
+    // هر کلید تا MAX_ATTEMPTS_PER_KEY بار امتحان می‌شود، ولی فقط برای خطاهای
+    // «گذرا» (429 / 5xx / تایم‌اوت / خطای شبکه). خطاهای دائمی (400 = درخواست
+    // خراب، 401/403 = کلید بد، 404 = مدل ناموجود) retry نمی‌شوند - تکرارشان
+    // فقط وقت تلف می‌کند. بودجه‌ی کل زمان هم محدود است تا از maxDuration
+    // ورسل (و تایم‌اوت ۳۰ثانیه‌ی کلاینت اندروید) رد نشویم.
+    const startedAt = Date.now();
+    const failures = []; // برای لاگ نهایی: چرا هر تلاش شکست خورد
+    const modelName = model || DEFAULT_MODEL;
+
+    for (let keyIdx = 0; keyIdx < geminiKeys.length; keyIdx++) {
+        const key = geminiKeys[keyIdx];
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_KEY; attempt++) {
+            const remaining = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
+            if (remaining < 3000) {
+                failures.push(`key#${keyIdx + 1}: بودجه‌ی زمانی تمام شد`);
+                break;
+            }
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 25000);
-            let response;
+            const timeoutId = setTimeout(() => controller.abort(), Math.min(BOT_PER_CALL_TIMEOUT_MS, remaining));
+            let retryable = false;
             try {
-                response = await fetch(
-                    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model || DEFAULT_MODEL)}:generateContent`,
+                const response = await fetch(
+                    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent`,
                     {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
@@ -245,25 +269,44 @@ async function getBotReply(historyForPrompt, model) {
                         signal: controller.signal
                     }
                 );
+
+                if (!response.ok) {
+                    const errBody = await response.text().catch(() => '');
+                    // فقط ۳۰۰ کاراکتر اول، بدون کلید (خود پاسخ گوگل کلید را نشان نمی‌دهد)
+                    failures.push(`key#${keyIdx + 1} try${attempt}: HTTP ${response.status} ${errBody.slice(0, 300).replace(/\s+/g, ' ')}`);
+                    retryable = response.status === 429 || response.status >= 500;
+                } else {
+                    const data = await response.json();
+                    const cand = data?.candidates?.[0];
+                    const text = cand?.content?.parts?.map(p => p?.text || '').join('').trim();
+                    if (text) return text;
+
+                    // جواب «موفق» ولی بدون متن: دلیلش را لاگ کن (SAFETY، MAX_TOKENS،
+                    // RECITATION، یا promptFeedback.blockReason). این‌ها retry نمی‌شوند
+                    // چون با همان ورودی همان نتیجه را می‌دهند.
+                    const why = cand?.finishReason
+                        || (data?.promptFeedback?.blockReason ? `prompt blocked: ${data.promptFeedback.blockReason}` : 'no candidates');
+                    failures.push(`key#${keyIdx + 1} try${attempt}: پاسخ بدون متن (${why})`);
+                    retryable = false;
+                }
+            } catch (err) {
+                const aborted = err?.name === 'AbortError';
+                failures.push(`key#${keyIdx + 1} try${attempt}: ${aborted ? 'timeout' : (err?.message || err)}`);
+                retryable = true; // تایم‌اوت/شبکه گذراست
             } finally {
                 clearTimeout(timeoutId);
             }
 
-            if (!response.ok) {
-                // کلید بعدی را امتحان کن؛ جزئیات دقیق خطای هر کلید برای این
-                // فیچر مهم نیست (برخلاف chat.js که کاربر مستقیم پیامش را
-                // می‌بیند، اینجا فقط اگر همه‌ی کلیدها شکست خوردند خطا می‌دهیم).
-                continue;
+            if (!retryable) break; // خطای دائمی این کلید: برو سراغ کلید بعدی
+            if (attempt < MAX_ATTEMPTS_PER_KEY) {
+                await new Promise(r => setTimeout(r, BOT_RETRY_DELAY_MS * attempt)); // backoff ساده
             }
-
-            const data = await response.json();
-            const text = data?.candidates?.[0]?.content?.parts?.map(p => p?.text || '').join('').trim();
-            if (text) return text;
-        } catch (_) {
-            continue;
         }
     }
 
+    // یک خط لاگ کامل: مدل + دلیل هر تلاش. این همان چیزی است که قبلاً نبود و
+    // باعث می‌شد فقط «پاسخ دریافت نشد» ببینیم بدون اینکه بفهمیم چرا.
+    console.error(`[shared-chats] Gemini failed (model=${modelName}, ${Date.now() - startedAt}ms): ${failures.join(' | ') || 'no attempts'}`);
     throw new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
 }
 
