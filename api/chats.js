@@ -151,14 +151,18 @@ module.exports = async function handler(req, res) {
             }
 
             if (chatId) {
+                // light=1 (اپ اندروید): html رندرشده (تا ۲MB) و files را نمی‌فرستد چون
+                // اپ فقط title/pinned/history را استفاده می‌کند؛ دانلود اولیه‌ی همه‌ی
+                // چت‌ها بعد از ورود به یک حساب خیلی سبک‌تر می‌شود. وب بدون light مثل قبل.
+                const light = String(req.query?.light || '') === '1';
                 const [chatRes, historyRes, filesRes] = await Promise.all([
-                    supaFetch(`chats?owner_email=eq.${encodeURIComponent(ownerEmail)}&chat_id=eq.${encodeURIComponent(chatId)}&select=*`),
+                    supaFetch(`chats?owner_email=eq.${encodeURIComponent(ownerEmail)}&chat_id=eq.${encodeURIComponent(chatId)}&select=${light ? 'chat_id,title,pinned,updated_at' : '*'}`),
                     supaFetch(`chat_history?owner_email=eq.${encodeURIComponent(ownerEmail)}&chat_id=eq.${encodeURIComponent(chatId)}&select=history`),
-                    supaFetch(`chat_files?owner_email=eq.${encodeURIComponent(ownerEmail)}&chat_id=eq.${encodeURIComponent(chatId)}&select=files`)
+                    light ? Promise.resolve(null) : supaFetch(`chat_files?owner_email=eq.${encodeURIComponent(ownerEmail)}&chat_id=eq.${encodeURIComponent(chatId)}&select=files`)
                 ]);
                 const chatRows = await chatRes.json();
                 const historyRows = await historyRes.json();
-                const filesRows = await filesRes.json();
+                const filesRows = filesRes ? await filesRes.json() : [];
                 if (!Array.isArray(chatRows) || !chatRows.length) {
                     return res.status(404).json({ error: 'گفتگو پیدا نشد.' });
                 }
