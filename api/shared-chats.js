@@ -18,7 +18,13 @@
 // POST /api/shared-chats?action=create   body:{title?, model?} -> چت جدید + inviteCode (مدل فقط همین‌جا و توسط سازنده تعیین می‌شود)
 // POST /api/shared-chats?action=join     body:{inviteCode} -> عضو شدن با کد دعوت
 // POST /api/shared-chats?action=upload   body:{chatId,base64,contentType,name} -> آپلود یک عکس به Supabase Storage (فقط اعضا)
-// POST /api/shared-chats?action=send     body:{chatId,text?,attachments?:[{path}]} -> ارسال پیام (+عکس) + پاسخ Gemini
+// POST /api/shared-chats?action=send     body:{chatId,text?,attachments?:[{path}]} -> ارسال پیام (+عکس) + پاسخ Gemini (غیر-استریم، سازگاری قدیمی)
+// POST /api/shared-chats?action=stream   body:{chatId,text?,attachments?:[{path}]} -> FEATURE: مثل send ولی پاسخ ربات را با
+//   Server-Sent Events تکه‌تکه پخش می‌کند (دقیقاً همون الگوی pages/api/chat.js: خط‌های
+//   `data: {...}\n\n`؛ رویدادهای ممکن: {userMessage:{...}} یک‌بار در همون اول،
+//   {text:"..."} به ازای هر تکه، و در پایان {done:true, botMessage:{...}}
+//   یا {done:true, botPending:true} یا {error:"..."}). کلاینت‌های قدیمی‌تر که
+//   هنوز از action=send استفاده می‌کنند دست‌نخورده کار می‌کنند.
 // GET  /api/shared-chats?action=download&chatId=..&path=.. -> دانلود یک عکس (فقط اعضا؛ پاسخ: {base64,contentType})
 //
 // نیازمندی‌های محیطی: همان SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY پروژه
@@ -220,6 +226,30 @@ async function fetchAttachmentsForMessages(messageIds) {
     return map;
 }
 
+// FEATURE (فیچر B - پرامپت بهتر): قبلاً این‌جا فقط ۴ خط بود (نه لحن، نه
+// قوانین قالب‌بندی/لیست، نه چیزی درباره‌ی شماره‌گذاری تودرتو) - برای همین
+// چت مشترک هم لحن خشک‌تری داشت و هم مشکل «بخش ۱، ۱، ۱» (تکرار شماره در
+// لیست‌های تودرتو) که مدل‌های کوچیک بدون راهنمایی صریح بهش دچار می‌شن.
+// این‌جا معادل خلاصه‌شده‌ی بخش «لحن» + «قالب‌بندی» از systemText اصلی
+// chat.js است (نگاه کن به pages/api/chat.js حدود خط ۵۳۶۴-۵۴۴۴)، نه کل
+// آن پرامپت ۲۹هزار کاراکتری (که شامل حافظه/ترجیحات/ویجت/SVG است و چت
+// مشترک فعلاً به هیچ‌کدام نیاز ندارد).
+const SHARED_CHAT_SYSTEM_TEXT =
+    'تو Virtual Bot هستی؛ دستیار هوش مصنوعی گرم، صمیمی و طبیعی به فارسی، مثل صحبت با یک دوست باهوش، نه متن خشک و رسمی.\n' +
+    'در این گفتگو ممکن است بیش از یک نفر با تو صحبت کند - هر پیام کاربر با نام فرستنده مشخص شده؛ ' +
+    'به هر نفر با توجه به کل زمینه‌ی گفتگو پاسخ بده، نه فقط آخرین پیام را جدا از بقیه در نظر بگیر. ' +
+    'اگر دو نفر همزمان موضوع‌های متفاوتی مطرح کرده‌اند، مشخص کن به کدام پیام/کدام فرد پاسخ می‌دهی.\n' +
+    'لحن: رسمی→محترمانه، دوستانه→صمیمی، شوخ→هم‌راستا. محاوره‌ای و روان باش؛ فقط عبارت‌های رایج و طبیعی فارسی. ' +
+    'سؤال ساده کوتاه جواب بده؛ موضوع پیچیده کامل و مرحله‌ای. جمله‌ی اول را طوری نساز که با پاسخ واقعی بعدی تناقض داشته باشد.\n' +
+    'ایموجی را مستقل از رفتار کاربر و طبیعی استفاده کن (لازم نیست کاربر اول ایموجی بزند)؛ در پاسخ‌های رسمی/فنی/جدی ایموجی کم یا اصلاً استفاده نکن؛ ' +
+    'هرگز 🤖 استفاده نکن و از ردیف طولانی ایموجی پرهیز کن.\n' +
+    'قالب‌بندی (فقط وقتی واقعاً لازم است): ایتالیک با *متن* یا _متن_؛ خط‌خورده با ~~متن~~؛ لینک واقعی با [متن](https://...)؛ ' +
+    'جدول مارک‌داون فقط برای داده‌ی واقعاً جدولی.\n' +
+    'قانون شماره‌گذاری لیست تودرتو (مهم): هر سطح فقط یک‌بار شماره/بولت بگیرد - هرگز ننویس «۱. بخش ۱» یا زیر آیتم شماره‌ی «۱» دوباره زیرشماره‌ی «۱.۱» را با پیشوند تکراری تکرار نکن؛ ' +
+    'برای زیرسطح از حروف (الف، ب) یا خط تیره‌ی ساده استفاده کن، نه تکرار همان عدد پدر. لیست تودرتو با ۲ فاصله برای هر سطح تورفتگی داشته باشد.\n' +
+    'ریاضی: درون‌خطی با $...$ و مستقل/بزرگ با $$...$$؛ علامت $ را escape نکن.\n' +
+    'درباره‌ی چیزهایی که نمی‌دانی اطلاعات ساختگی نده و بگو مطمئن نیستی.';
+
 // ===== پاسخ ربات: یک generateContent ساده (بدون استریم/ابزار) با
 // چرخش بین چند کلید API، دقیقاً هم‌الگو با تابع تولید عنوان در
 // chat.js. چت مشترک برای شروع نیازی به search/file-edit ندارد. =====
@@ -230,11 +260,7 @@ async function getBotReply(historyForPrompt, model) {
         throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
     }
 
-    const systemText =
-        'تو Virtual Bot هستی؛ دستیار هوش مصنوعی گرم و صمیمی به فارسی. ' +
-        'در این گفتگو ممکن است بیش از یک نفر با تو صحبت کند - هر پیام با ' +
-        'نام فرستنده مشخص شده؛ به هر دو نفر با توجه به کل زمینه‌ی گفتگو ' +
-        'پاسخ بده، نه فقط آخرین پیام را جدا از بقیه در نظر بگیر.';
+    const systemText = SHARED_CHAT_SYSTEM_TEXT;
 
     // هر کلید تا MAX_ATTEMPTS_PER_KEY بار امتحان می‌شود، ولی فقط برای خطاهای
     // «گذرا» (429 / 5xx / تایم‌اوت / خطای شبکه). خطاهای دائمی (400 = درخواست
@@ -307,6 +333,118 @@ async function getBotReply(historyForPrompt, model) {
     // یک خط لاگ کامل: مدل + دلیل هر تلاش. این همان چیزی است که قبلاً نبود و
     // باعث می‌شد فقط «پاسخ دریافت نشد» ببینیم بدون اینکه بفهمیم چرا.
     console.error(`[shared-chats] Gemini failed (model=${modelName}, ${Date.now() - startedAt}ms): ${failures.join(' | ') || 'no attempts'}`);
+    throw new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
+}
+
+// FEATURE (فیچر A - استریم): معادل استریمی getBotReply. با
+// streamGenerateContent?alt=sse (همون endpoint چت عادی chat.js) تماس
+// می‌گیرد و هر تکه‌ی متن رسیده را فوری با onChunk به بیرون می‌فرستد -
+// این‌طوری کاربر اولین کلمه را طی ~۱ ثانیه می‌بیند، نه بعد از ۵-۱۰ ثانیه
+// انتظار برای کل جواب (که تنها دلیل کندی محسوس چت مشترک نسبت به چت
+// عادی همین بود، نه Supabase/polling).
+// همان منطق retry/کلید چندگانه‌ی getBotReply این‌جا هم رعایت شده تا
+// افت پایداری نداشته باشیم.
+async function streamBotReply(historyForPrompt, model, onChunk) {
+    const geminiKeys = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '')
+        .split(',').map(k => k.trim()).filter(Boolean);
+    if (!geminiKeys.length) {
+        throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
+    }
+
+    const startedAt = Date.now();
+    const failures = [];
+    const modelName = model || DEFAULT_MODEL;
+
+    for (let keyIdx = 0; keyIdx < geminiKeys.length; keyIdx++) {
+        const key = geminiKeys[keyIdx];
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_KEY; attempt++) {
+            const remaining = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
+            if (remaining < 3000) {
+                failures.push(`key#${keyIdx + 1}: بودجه‌ی زمانی تمام شد`);
+                break;
+            }
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), Math.min(BOT_PER_CALL_TIMEOUT_MS, remaining));
+            let retryable = false;
+            // FIX: اگر وسط استریم چند توکن واقعاً به کلاینت فرستاده شده
+            // باشد ولی خودِ اتصال قطع/ارور شود، دیگر نباید یک بار دیگر
+            // (روی کلید بعدی) از اول جواب بدهیم - کلاینت یک پاسخ نصفه با
+            // متن تکراری می‌بیند. پس اگر تا اینجا چیزی emit شده، به‌جای
+            // retryable=true، خطا را همون‌جا بالا می‌بریم.
+            let emittedAny = false;
+            try {
+                const response = await fetch(
+                    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:streamGenerateContent?alt=sse`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+                        body: JSON.stringify({
+                            systemInstruction: { parts: [{ text: SHARED_CHAT_SYSTEM_TEXT }] },
+                            contents: historyForPrompt
+                        }),
+                        signal: controller.signal
+                    }
+                );
+
+                if (!response.ok) {
+                    const errBody = await response.text().catch(() => '');
+                    failures.push(`key#${keyIdx + 1} try${attempt}: HTTP ${response.status} ${errBody.slice(0, 300).replace(/\s+/g, ' ')}`);
+                    retryable = response.status === 429 || response.status >= 500;
+                } else {
+                    let fullText = '';
+                    let buffer = '';
+                    // Node/Vercel: response.body یک async iterable از Buffer/Uint8Array است
+                    // (همون الگویی که خودِ chat.js برای پایپ‌کردن استریم Gemini استفاده می‌کند).
+                    for await (const rawChunk of response.body) {
+                        buffer += Buffer.isBuffer(rawChunk) ? rawChunk.toString('utf8') : String(rawChunk);
+                        // SSE: خط‌های "data: {...}" جدا با یک خط خالی. تا وقتی
+                        // یک بلوک کامل (پایان با \n\n) نداریم صبر می‌کنیم.
+                        let sepIdx;
+                        while ((sepIdx = buffer.indexOf('\n\n')) !== -1) {
+                            const rawEvent = buffer.slice(0, sepIdx);
+                            buffer = buffer.slice(sepIdx + 2);
+                            const line = rawEvent.split('\n').find(l => l.startsWith('data:'));
+                            if (!line) continue;
+                            const jsonStr = line.slice(5).trim();
+                            if (!jsonStr || jsonStr === '[DONE]') continue;
+                            let parsed;
+                            try { parsed = JSON.parse(jsonStr); } catch (_) { continue; }
+                            const cand = parsed?.candidates?.[0];
+                            const pieceText = cand?.content?.parts?.map(p => p?.text || '').join('') || '';
+                            if (pieceText) {
+                                fullText += pieceText;
+                                emittedAny = true;
+                                onChunk(pieceText);
+                            }
+                        }
+                    }
+                    if (fullText.trim()) return fullText;
+                    failures.push(`key#${keyIdx + 1} try${attempt}: پاسخ استریم بدون متن`);
+                    retryable = false;
+                }
+            } catch (err) {
+                const aborted = err?.name === 'AbortError';
+                failures.push(`key#${keyIdx + 1} try${attempt}: ${aborted ? 'timeout' : (err?.message || err)}`);
+                if (emittedAny) {
+                    clearTimeout(timeoutId);
+                    // چیزی از قبل به کاربر رسیده - دیگر retry نکن، همون‌قدر که
+                    // رسیده را به‌عنوان جواب نهایی قبول کن تا چیزی گم/تکرار نشود.
+                    console.error(`[shared-chats] stream interrupted mid-way (model=${modelName}): ${err?.message || err}`);
+                    throw new Error('پاسخ ربات وسط راه قطع شد.');
+                }
+                retryable = true;
+            } finally {
+                clearTimeout(timeoutId);
+            }
+
+            if (!retryable) break;
+            if (attempt < MAX_ATTEMPTS_PER_KEY) {
+                await new Promise(r => setTimeout(r, BOT_RETRY_DELAY_MS * attempt));
+            }
+        }
+    }
+
+    console.error(`[shared-chats] Gemini stream failed (model=${modelName}, ${Date.now() - startedAt}ms): ${failures.join(' | ') || 'no attempts'}`);
     throw new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
 }
 
@@ -711,6 +849,170 @@ module.exports = async function handler(req, res) {
                 // این را جدا اعلام می‌کنیم تا کلاینت پیام کاربر را از دست
                 // ندهد، فقط بگوید «ربات جواب نداد، دوباره امتحان کن».
                 return res.status(502).json({ message: userMsg, error: 'پاسخ ربات دریافت نشد.' });
+            } finally {
+                await releaseLock(chatId);
+            }
+        }
+
+        // ===== POST action=stream: FEATURE (فیچر A) - مثل send، ولی پاسخ
+        // ربات را با SSE تکه‌تکه پخش می‌کند به‌جای اینکه کاربر تا آخر جواب
+        // کامل هیچ‌چی نبیند. اعتبارسنجی/ذخیره‌ی پیام کاربر و مدیریت قفل
+        // دقیقاً عین action=send است (کپی عمدی، نه فراخوانی مشترک، تا
+        // مسیر send برای کلاینت‌های قدیمی‌تر بدون هیچ ریسکی دست‌نخورده بماند).
+        if (action === 'stream') {
+            const chatId = String(req.body?.chatId || '').trim();
+            const text = String(req.body?.text || '').trim();
+            const rawAttachments = Array.isArray(req.body?.attachments) ? req.body.attachments : [];
+            if (!chatId || (!text && !rawAttachments.length)) {
+                return res.status(400).json({ error: 'chatId یا (text/attachments) مشخص نشده.' });
+            }
+            if (text.length > MAX_MESSAGE_CHARS) {
+                return res.status(413).json({ error: `پیام نباید بیشتر از ${MAX_MESSAGE_CHARS} کاراکتر باشد.` });
+            }
+            if (rawAttachments.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+                return res.status(413).json({ error: `حداکثر ${MAX_ATTACHMENTS_PER_MESSAGE} عکس در هر پیام مجاز است.` });
+            }
+            if (!(await isParticipant(chatId, email))) {
+                return res.status(403).json({ error: 'عضو این گفتگوی مشترک نیستی.' });
+            }
+
+            const requiredPrefix = `shared/${encodeURIComponent(chatId)}/`;
+            const validAttachments = [];
+            for (const att of rawAttachments) {
+                const path = String(att?.path || '');
+                if (!path.startsWith(requiredPrefix) || path.includes('..')) {
+                    return res.status(400).json({ error: 'مسیر عکس نامعتبر است.' });
+                }
+                const headResp = await downloadFromStorage(path);
+                if (!headResp.ok) {
+                    return res.status(400).json({ error: 'یکی از عکس‌ها پیدا نشد؛ دوباره آپلودش کن.' });
+                }
+                const bytes = Buffer.from(await headResp.arrayBuffer());
+                const realType = (headResp.headers.get('content-type') || '').split(';')[0].trim();
+                if (!ALLOWED_IMAGE_TYPES.includes(realType) || bytes.length > MAX_UPLOAD_SIZE) {
+                    return res.status(400).json({ error: 'یکی از عکس‌ها نامعتبر است.' });
+                }
+                validAttachments.push({
+                    path,
+                    contentType: realType,
+                    name: String(att?.name || 'image').slice(0, 150),
+                    size: bytes.length
+                });
+            }
+
+            const userMsg = await insertMessage(chatId, 'user', email, text);
+            if (!userMsg) {
+                await Promise.all(validAttachments.map(a => deleteFromStorage(a.path)));
+                return res.status(500).json({ error: 'ذخیره‌ی پیام ناموفق بود.' });
+            }
+            if (validAttachments.length) {
+                const attResp = await supaFetch('shared_chat_attachments', {
+                    method: 'POST',
+                    body: JSON.stringify(validAttachments.map(a => ({
+                        message_id: userMsg.id,
+                        chat_id: chatId,
+                        storage_path: a.path,
+                        content_type: a.contentType,
+                        file_name: a.name,
+                        size_bytes: a.size,
+                        created_at: Date.now()
+                    })))
+                });
+                if (!attResp.ok) {
+                    console.error('[shared-chats] attachments insert failed:', await attResp.text().catch(() => ''));
+                    await supaFetch(`shared_chat_messages?id=eq.${userMsg.id}`, { method: 'DELETE' });
+                    await Promise.all(validAttachments.map(a => deleteFromStorage(a.path)));
+                    return res.status(500).json({ error: 'ذخیره‌ی عکس‌ها ناموفق بود؛ دوباره امتحان کن.' });
+                }
+                userMsg.attachments = validAttachments.map(a => ({
+                    path: a.path, contentType: a.contentType, name: a.name, size: a.size
+                }));
+            } else {
+                userMsg.attachments = [];
+            }
+            await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ updated_at: Date.now() })
+            });
+
+            // FIX: از همین‌جا به بعد پاسخ HTTP دیگر یک JSON عادی نیست -
+            // هدرهای SSE را دستی می‌نویسیم (دقیقاً هم‌الگو با
+            // pages/api/chat.js) چون بعد از این هر خطای await باید به‌جای
+            // res.status(...).json(...) با یک event {error:...} به کلاینت
+            // برسد؛ کلاینت دیگر منتظر status code جدید نمی‌ماند.
+            res.writeHead(200, {
+                'Content-Type': 'text/event-stream; charset=utf-8',
+                'Cache-Control': 'no-cache, no-transform',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no'
+            });
+            if (typeof res.flushHeaders === 'function') res.flushHeaders();
+            const sendEvent = (obj) => {
+                res.write(`data: ${JSON.stringify(obj)}\n\n`);
+                if (typeof res.flush === 'function') res.flush();
+            };
+            // اولین event: پیام کاربر (با id واقعی سرور) - کلاینت این را
+            // فوری جایگزین نسخه‌ی optimistic خودش می‌کند، دقیقاً مثل چیزی
+            // که قبلاً از فیلد "message" در پاسخ غیر-استریمی می‌خواند.
+            sendEvent({ userMessage: userMsg });
+
+            const gotLock = await acquireLock(chatId, email);
+            if (!gotLock) {
+                sendEvent({ done: true, botPending: true });
+                return res.end();
+            }
+
+            try {
+                const historyResp = await supaFetch(
+                    `shared_chat_messages?chat_id=eq.${encodeURIComponent(chatId)}&select=id,role,sender_email,text&order=id.desc&limit=100`
+                );
+                const historyRowsDesc = await historyResp.json();
+                const historyRows = Array.isArray(historyRowsDesc) ? historyRowsDesc.reverse() : [];
+
+                const attMap = await fetchAttachmentsForMessages(historyRows.map(r => r.id));
+                const allImages = [];
+                for (const row of historyRows) {
+                    for (const att of (attMap[row.id] || [])) allImages.push({ msgId: row.id, att });
+                }
+                const sendableImages = new Set(allImages.slice(-MAX_IMAGES_TO_BOT).map(x => x.att.id));
+
+                const historyForPrompt = [];
+                for (const row of historyRows) {
+                    const parts = [];
+                    const label = row.role === 'user' && row.sender_email ? `[${row.sender_email}]: ` : '';
+                    const rowAtts = attMap[row.id] || [];
+                    const bodyText = (row.text || '') + (rowAtts.length && !row.text ? '(عکس فرستاده شد)' : '');
+                    parts.push({ text: `${label}${bodyText}` });
+
+                    for (const att of rowAtts) {
+                        if (!sendableImages.has(att.id)) {
+                            parts.push({ text: '[عکس قدیمی‌تر - برای صرفه‌جویی در حجم، دوباره فرستاده نشد]' });
+                            continue;
+                        }
+                        const imgResp = await downloadFromStorage(att.path);
+                        if (!imgResp.ok) continue;
+                        const b64 = Buffer.from(await imgResp.arrayBuffer()).toString('base64');
+                        parts.push({ inlineData: { mimeType: att.contentType, data: b64 } });
+                    }
+                    historyForPrompt.push({ role: row.role === 'model' ? 'model' : 'user', parts });
+                }
+
+                const chatModel = await getChatModel(chatId);
+                const botText = await streamBotReply(historyForPrompt, chatModel, (piece) => {
+                    sendEvent({ text: piece });
+                });
+                const botMsg = await insertMessage(chatId, 'model', null, botText);
+                await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ updated_at: Date.now() })
+                });
+                if (botMsg) botMsg.attachments = [];
+                sendEvent({ done: true, botMessage: botMsg });
+                return res.end();
+            } catch (err) {
+                console.error('[shared-chats] stream bot reply failed:', err?.message || err);
+                sendEvent({ error: 'پاسخ ربات دریافت نشد.' });
+                return res.end();
             } finally {
                 await releaseLock(chatId);
             }
