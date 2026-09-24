@@ -1,611 +1,681 @@
-package com.virtualchat.app
+// api/shared-chats.js
+//
+// FEATURE: چت مشترک - دو (یا چند) کاربر لاگین‌شده همزمان با هم و با ربات
+// در یک گفتگو صحبت می‌کنند. کاملاً جدا از چت‌های شخصی (جدول‌های
+// chats/chat_history) است؛ اینجا جدول‌های shared_chats/
+// shared_chat_participants/shared_chat_messages/shared_chat_locks
+// استفاده می‌شود (نگاه کن به schema_additions.sql).
+//
+// امنیت مثل api/chats.js: کلاینت token را در Authorization می‌فرستد،
+// اینجا در جدول sessions بررسی و ایمیل معتبر آن استخراج می‌شود. کاربر
+// روی هیچ عملیاتی (خواندن/نوشتن پیام) دسترسی ندارد مگر واقعاً عضو
+// shared_chat_participants همان چت باشد - این چک همه‌جا تکرار می‌شود،
+// چون اینجا (برخلاف چت شخصی) owner_email به‌تنهایی کافی نیست، هر
+// عضوی (نه فقط سازنده) باید بتواند بخواند/بفرستد.
+//
+// GET  /api/shared-chats                                -> لیست چت‌های مشترکی که کاربر عضو آنهاست
+// GET  /api/shared-chats?chatId=..&since=<id>            -> پیام‌های جدیدتر از id داده‌شده (polling)
+// POST /api/shared-chats?action=create   body:{title?, model?} -> چت جدید + inviteCode (مدل فقط همین‌جا و توسط سازنده تعیین می‌شود)
+// POST /api/shared-chats?action=join     body:{inviteCode} -> عضو شدن با کد دعوت
+// POST /api/shared-chats?action=upload   body:{chatId,base64,contentType,name} -> آپلود یک عکس به Supabase Storage (فقط اعضا)
+// POST /api/shared-chats?action=send     body:{chatId,text?,attachments?:[{path}]} -> ارسال پیام (+عکس) + پاسخ Gemini
+// GET  /api/shared-chats?action=download&chatId=..&path=.. -> دانلود یک عکس (فقط اعضا؛ پاسخ: {base64,contentType})
+//
+// نیازمندی‌های محیطی: همان SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY پروژه
+// (نگاه کن به api/chats.js) + GEMINI_API_KEYS (یا GEMINI_API_KEY) برای
+// پاسخ ربات.
 
-import android.net.Uri
-import android.widget.Toast
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.outlined.ContentCopy
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.layout.ContentScale
-import coil.compose.AsyncImage
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+const crypto = require('crypto');
 
-/**
- * FEATURE: چت مشترک - صفحه‌ی گفتگوی زنده که دو (یا بیشتر) کاربر توی یک
- * چت مشترک با ربات صحبت می‌کنند. چون سرور (api/shared-chats.js) بر مبنای
- * polling طراحی شده (نه WebSocket)، این صفحه هر ۲ ثانیه یک‌بار پیام‌های
- * جدید را از SharedChatApiClient.pollMessages می‌گیرد.
- *
- * پیام‌های "user" با ایمیل فرستنده نمایش داده می‌شوند (سرور فقط ایمیل
- * دارد، نه اسم نمایشی - نگاه کن به SharedChatMessage.senderEmail) تا
- * مشخص باشد کدام پیام مال کدام نفر است - نکته‌ای که این چت را از
- * ChatScreen معمولی متمایز می‌کند.
- *
- * FIX (دو باگ گزارش‌شده):
- * ۱) پیام کاربر دیر می‌آمد: قبلاً sendCurrentInput فقط sendMessage را
- *    صدا می‌زد و نتیجه‌اش را کلاً دور می‌ریخت - پیام تا poll بعدی (حداکثر
- *    ۲ ثانیه) اصلاً روی صفحه نبود. حالا فوری (optimistic) با یک id موقت
- *    منفی به لیست اضافه می‌شود، و وقتی sendMessage جواب واقعی (با id
- *    واقعی سرور) برگرداند، جایگزینش می‌شود.
- * ۲) جواب ربات نمی‌آمد: SharedChatApiClient.sendMessage قبلاً پاسخ سرور
- *    را با کلیدهای نادرست parse می‌کرد (نگاه کن به توضیح کامل در همان
- *    فایل) - جواب ربات هیچ‌وقت پیدا نمی‌شد، نه در همین درخواست نه بعداً
- *    (چون polling هم چیزی متفاوت دریافت نمی‌کرد؛ خودِ ذخیره‌سازی سمت سرور
- *    درست بود، فقط parse سمت اپ اشتباه بود). حالا botMessage از
- *    SendMessageResult مستقیم استفاده می‌شود، و اگه سرور بگوید
- *    botPending=true (یکی دیگر مشغول است)، isWaitingForReply روشن
- *    می‌ماند تا polling جواب را برساند.
- */
-private const val POLL_INTERVAL_MS = 2000L
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
-// FIX: اگه جواب ربات بعد از این مدت نیومد، «در حال تایپ» خودکار خاموش
-// می‌شه (قبلاً روی خطای سرور تا ابد می‌ماند).
-private const val TYPING_TIMEOUT_MS = 45_000L
+const MAX_SHARED_CHATS_PER_USER = 50; // سقف امنیتی مشابه MAX_CHATS_PER_USER در api/chats.js
+const MAX_MESSAGE_CHARS = 8000;
+const MAX_MESSAGES_PER_POLL = 200;
+const LOCK_STALE_MS = 30 * 1000; // اگر قفل قدیمی‌تر از این بود، یعنی درخواست قبلی هنگ/کرش کرده - نادیده‌اش می‌گیریم
 
-/**
- * FIX (کرش «Key "10" was already used»): پیام ربات هم از پاسخ خودِ
- * sendMessage می‌رسید و هم از polling (با فاصله‌ی چند میلی‌ثانیه) و هر دو
- * به لیست اضافه‌اش می‌کردند؛ دو آیتم با key یکسان توی LazyColumn = کرش.
- * این تابع پیام‌های جدید را ادغام می‌کند و هر id واقعی (مثبت) را فقط یک‌بار
- * نگه می‌دارد. پیام‌های optimistic (id منفی) که نسخه‌ی واقعی‌شان رسیده هم
- * حذف می‌شوند.
- */
-private fun mergeMessages(
-    current: List<SharedChatMessage>,
-    incoming: List<SharedChatMessage>
-): List<SharedChatMessage> {
-    if (incoming.isEmpty()) return current
-    val existingIds = current.filter { it.id > 0 }.map { it.id }.toHashSet()
-    val fresh = incoming.filter { it.id > 0 && it.id !in existingIds }.distinctBy { it.id }
-    if (fresh.isEmpty()) return current
-    // پیام‌های optimistic با همان متن (یا فقط-عکس: متن خالی + داشتن عکس) که
-    // نسخه‌ی واقعی‌شان رسیده حذف می‌شوند.
-    val realUserKeys = fresh.filter { it.role == "user" }
-        .map { it.text to it.attachments.isNotEmpty() }.toSet()
-    return current.filter {
-        !(it.id < 0 && (it.text to it.localImageUris.isNotEmpty()) in realUserKeys)
-    } + fresh
+// ===== عکس در چت مشترک (Supabase Storage) =====
+// از همان باکت چت‌های شخصی استفاده می‌کنیم ولی زیر پیشوند جدا (shared/)
+// تا هیچ تداخلی با مسیرهای <email>/<chatId>/... در api/chats.js نباشد.
+const STORAGE_BUCKET = 'chat-attachments';
+const MAX_UPLOAD_SIZE = 5 * 1024 * 1024;        // 5MB برای هر عکس (باکت رایگان 1GB است)
+const MAX_ATTACHMENTS_PER_MESSAGE = 4;
+const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+// فقط عکس‌های این‌قدر پیام اخیر برای ربات فرستاده می‌شود؛ وگرنه با یک
+// چت پر از عکس، حجم درخواست به Gemini (و زمان پاسخ) بی‌رویه بالا می‌رود.
+const MAX_IMAGES_TO_BOT = 6;
+
+// ===== مدل ثابت هر چت مشترک =====
+// فقط مدل‌های این لیست پذیرفته می‌شوند تا کاربر نتواند یک رشته‌ی دلخواه
+// را داخل URL درخواست Gemini بنشاند. اگر مدل‌های موردنظرت فرق دارند،
+// فقط همین لیست را عوض کن (اولین مورد پیش‌فرض است).
+// همان سه مدلی که چیپ انتخاب مدل در اپ (MainActivity modelOptions) نشان
+// می‌دهد. gemini-3.6-flash هم نگه داشته شده چون چت‌های مشترکی که قبل از
+// این فیچر ساخته شده‌اند در دیتابیس همین مقدار را دارند (default ستون).
+const ALLOWED_MODELS = [
+    'gemini-3.8-flash',        // Virtual Bot 1.7 - پیش‌فرض اپ
+    'gemini-3.5-flash-lite',   // Virtual Bot 1.1
+    'gemini-3.1-pro-preview',  // Virtual Bot 1.3
+    'gemini-3.6-flash'         // قدیمی (سازگاری با چت‌های قبلی)
+];
+const DEFAULT_MODEL = 'gemini-3.8-flash';
+
+function setCors(res) {
+    res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
 
-/**
- * FEATURE (هم‌ظاهر‌سازی با چت عادی - طبق درخواست کاربر): پس‌زمینه، هدر،
- * نوار ورودی، «در حال تایپ» و حباب‌ها حالا از همان کامپوننت‌های
- * ChatScreen استفاده می‌کنند (ChatHeaderBar / ChatComposerBar /
- * TypingIndicatorDots / MessageBlockView) و فقط منطق مخصوص چت مشترک
- * (polling، ایمیل فرستنده، کد دعوت، ادغام پیام‌ها) اینجا مانده.
- *
- * تصمیم‌ها (طبق پاسخ کاربر): دکمه‌ی تفکر/ویدیو/فایل/ویس نیست؛ فقط
- * «افزودن عکس» و چیپ مدل.
- *
- * مرحله‌ی ۲ (فعال): عکس و مدل حالا واقعاً به سرور می‌روند.
- * - عکس: هر عکس با همان فشرده‌ساز چت عادی (uriToAttachedImage) فشرده و
- *   جدا آپلود می‌شود (SharedChatApiClient.uploadImage)، سپس مسیرها
- *   همراه sendMessage می‌روند. عکس‌ها فقط بعد از دانلود (downloadImage)
- *   برای همه‌ی اعضا نمایش داده می‌شوند.
- * - مدل: برای کل چت ثابت است و سازنده موقع ساخت انتخاب می‌کند
- *   (SharedChatListDialog). این‌جا چیپ مدل فقط نمایشی/قفل است - همه‌ی
- *   اعضا همان مدل چت را می‌بینند و کسی نمی‌تواند وسط چت عوضش کند.
- *
- تصمیم چیدمان: چون چت چندنفره است، پیام «خودم» سمت راست (مثل چت
- * عادی) و پیام دیگران سمت چپ با برچسب اسم؛ ربات بدون حباب (مثل چت
- * عادی) ولی هم‌عرض با محتوای خودش.
- */
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-fun SharedChatScreen(
-    chatId: String,
-    title: String,
-    inviteCode: String?,
-    // مدل ثابت این چت (از سرور). null = سرور قدیمی/ناشناخته → پیش‌فرض اپ.
-    chatModel: String? = null,
-    onBack: () -> Unit
-) {
-    val context = LocalContext.current
-    val clipboard = LocalClipboardManager.current
-    val coroutineScope = rememberCoroutineScope()
-    val listState = rememberLazyListState()
-    val myEmail = remember { SessionPrefs.getEmail(context) }
+// ===== همان الگوی api/chats.js: تأیید هویت با session token داخلی =====
+async function verifySessionToken(token) {
+    if (!token) return null;
+    try {
+        const resp = await supaFetch(`sessions?token=eq.${encodeURIComponent(token)}&select=email,expires_at`);
+        if (!resp.ok) return null;
+        const rows = await resp.json();
+        if (!Array.isArray(rows) || !rows.length) return null;
+        const session = rows[0];
+        if (Number(session.expires_at) < Date.now()) return null;
+        return String(session.email).toLowerCase();
+    } catch (err) {
+        console.error('[shared-chats] verifySessionToken threw:', err?.message || err);
+        return null;
+    }
+}
 
-    var messages by remember { mutableStateOf(listOf<SharedChatMessage>()) }
-    var lastId by remember { mutableStateOf(0L) }
-    var inputText by remember { mutableStateOf("") }
-    var isSending by remember { mutableStateOf(false) }
-    var isWaitingForReply by remember { mutableStateOf(false) }
-    // شمارنده‌ی id موقت برای پیام‌های optimistic (منفی، تا هیچ‌وقت با id
-    // واقعی سرور - که همیشه مثبت است - تداخل نکند).
-    var nextTempId by remember { mutableStateOf(-1L) }
+function getBearerToken(req) {
+    const header = req.headers['authorization'] || '';
+    const match = /^Bearer\s+(.+)$/i.exec(header);
+    return match ? match[1] : null;
+}
 
-    // --- وضعیت UI مخصوص نوار ورودی مشترک با چت عادی ---
-    val pendingImageUris = remember { mutableStateListOf<Uri>() }
-    // مدل چت ثابت است (تعیین‌شده توسط سازنده)؛ فقط برای نمایش برچسب.
-    val fixedModelId = remember(chatModel) { chatModel ?: DEFAULT_SHARED_MODEL_ID }
-    val fixedModelLabel = remember(fixedModelId) { sharedModelLabel(fixedModelId) }
-
-    val imagePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetMultipleContents()
-    ) { uris: List<Uri> ->
-        if (uris.isEmpty()) return@rememberLauncherForActivityResult
-        val remaining = MAX_PENDING_IMAGES - pendingImageUris.size
-        if (remaining <= 0) {
-            Toast.makeText(context, "حداکثر $MAX_PENDING_IMAGES عکس در هر پیام", Toast.LENGTH_SHORT).show()
-            return@rememberLauncherForActivityResult
+async function supaFetch(path, options = {}) {
+    return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+        ...options,
+        headers: {
+            'apikey': SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            ...(options.headers || {})
         }
-        for (uri in uris.take(remaining)) {
-            coroutineScope.launch {
-                val local = MediaPersist.persist(context, uri, "jpg")
-                if (local == null) {
-                    Toast.makeText(context, "خواندن این عکس ممکن نشد.", Toast.LENGTH_SHORT).show()
-                } else if (pendingImageUris.size < MAX_PENDING_IMAGES) {
-                    pendingImageUris.add(local)
-                } else {
-                    MediaPersist.discard(local)
-                }
+    });
+}
+
+function generateChatId() {
+    return crypto.randomBytes(16).toString('hex');
+}
+
+// کد دعوت کوتاه و خوانا (بدون کاراکترهای شبیه‌به‌هم مثل 0/O یا 1/I).
+const INVITE_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function generateInviteCode() {
+    let code = '';
+    for (let i = 0; i < 6; i++) {
+        code += INVITE_CODE_ALPHABET[crypto.randomInt(0, INVITE_CODE_ALPHABET.length)];
+    }
+    return code;
+}
+
+// بررسی می‌کند که این ایمیل واقعاً عضو این چت مشترک است؛ همه‌جا قبل از
+// خواندن/نوشتن صدا زده می‌شود چون این‌جا (برخلاف چت شخصی) مالکیت به
+// چند نفر تعلق دارد، نه فقط owner_email.
+async function isParticipant(chatId, email) {
+    const resp = await supaFetch(
+        `shared_chat_participants?chat_id=eq.${encodeURIComponent(chatId)}&email=eq.${encodeURIComponent(email)}&select=email`
+    );
+    if (!resp.ok) return false;
+    const rows = await resp.json();
+    return Array.isArray(rows) && rows.length > 0;
+}
+
+
+// ===== Storage helpers (Supabase Storage REST) =====
+// مسیر: shared/<chatId>/<timestamp>_<نام امن>. برخلاف چت شخصی، ایمیل
+// آپلودکننده در مسیر نیست چون دسترسی بر اساس عضویت در چت است، نه مالکیت.
+function sharedStoragePath(chatId, fileName) {
+    const safeName = String(fileName || 'image').replace(/[^\w.\-]+/g, '_').slice(0, 100);
+    const rand = crypto.randomBytes(4).toString('hex');
+    return `shared/${encodeURIComponent(chatId)}/${Date.now()}_${rand}_${safeName}`;
+}
+
+async function uploadToStorage(objectPath, buffer, contentType) {
+    return fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
+        method: 'POST',
+        headers: {
+            'apikey': SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': contentType || 'application/octet-stream',
+            'x-upsert': 'false'
+        },
+        body: buffer
+    });
+}
+
+async function downloadFromStorage(objectPath) {
+    return fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
+        headers: {
+            'apikey': SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+        }
+    });
+}
+
+async function deleteFromStorage(objectPath) {
+    // best-effort: اگر پاک نشد، مشکلی برای کاربر پیش نمی‌آید (فقط یک فایل یتیم می‌ماند)
+    try {
+        await fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
+            method: 'DELETE',
+            headers: {
+                'apikey': SUPABASE_SERVICE_ROLE_KEY,
+                'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
             }
+        });
+    } catch (_) { /* ignore */ }
+}
+
+// مدل ثابت این چت را از دیتابیس می‌خواند. اگر ستون/ردیف مشکل داشت یا مدل
+// دیگر در لیست مجاز نبود، به پیش‌فرض برمی‌گردیم تا چت از کار نیفتد.
+async function getChatModel(chatId) {
+    try {
+        const resp = await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}&select=model`);
+        if (!resp.ok) return DEFAULT_MODEL;
+        const rows = await resp.json();
+        const model = Array.isArray(rows) && rows[0] && rows[0].model;
+        return ALLOWED_MODELS.includes(model) ? model : DEFAULT_MODEL;
+    } catch (_) {
+        return DEFAULT_MODEL;
+    }
+}
+
+// عکس‌های چند پیام را یک‌جا می‌گیرد و به‌صورت map از message_id -> [attachment] برمی‌گرداند
+// (یک query برای کل batch، نه یک query به ازای هر پیام).
+async function fetchAttachmentsForMessages(messageIds) {
+    const map = {};
+    if (!messageIds.length) return map;
+    const resp = await supaFetch(
+        `shared_chat_attachments?message_id=in.(${messageIds.join(',')})&select=id,message_id,storage_path,content_type,file_name,size_bytes&order=id.asc`
+    );
+    if (!resp.ok) return map;
+    const rows = await resp.json();
+    if (!Array.isArray(rows)) return map;
+    for (const row of rows) {
+        (map[row.message_id] = map[row.message_id] || []).push({
+            id: row.id,
+            path: row.storage_path,
+            contentType: row.content_type,
+            name: row.file_name,
+            size: row.size_bytes
+        });
+    }
+    return map;
+}
+
+// ===== پاسخ ربات: یک generateContent ساده (بدون استریم/ابزار) با
+// چرخش بین چند کلید API، دقیقاً هم‌الگو با تابع تولید عنوان در
+// chat.js. چت مشترک برای شروع نیازی به search/file-edit ندارد. =====
+async function getBotReply(historyForPrompt, model) {
+    const geminiKeys = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '')
+        .split(',').map(k => k.trim()).filter(Boolean);
+    if (!geminiKeys.length) {
+        throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
+    }
+
+    const systemText =
+        'تو Virtual Bot هستی؛ دستیار هوش مصنوعی گرم و صمیمی به فارسی. ' +
+        'در این گفتگو ممکن است بیش از یک نفر با تو صحبت کند - هر پیام با ' +
+        'نام فرستنده مشخص شده؛ به هر دو نفر با توجه به کل زمینه‌ی گفتگو ' +
+        'پاسخ بده، نه فقط آخرین پیام را جدا از بقیه در نظر بگیر.';
+
+    for (const key of geminiKeys) {
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 25000);
+            let response;
+            try {
+                response = await fetch(
+                    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model || DEFAULT_MODEL)}:generateContent`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+                        body: JSON.stringify({
+                            systemInstruction: { parts: [{ text: systemText }] },
+                            contents: historyForPrompt
+                        }),
+                        signal: controller.signal
+                    }
+                );
+            } finally {
+                clearTimeout(timeoutId);
+            }
+
+            if (!response.ok) {
+                // کلید بعدی را امتحان کن؛ جزئیات دقیق خطای هر کلید برای این
+                // فیچر مهم نیست (برخلاف chat.js که کاربر مستقیم پیامش را
+                // می‌بیند، اینجا فقط اگر همه‌ی کلیدها شکست خوردند خطا می‌دهیم).
+                continue;
+            }
+
+            const data = await response.json();
+            const text = data?.candidates?.[0]?.content?.parts?.map(p => p?.text || '').join('').trim();
+            if (text) return text;
+        } catch (_) {
+            continue;
         }
     }
 
-    fun scrollToBottom() {
-        coroutineScope.launch {
-            // +1 چون ممکن است آیتم «در حال تایپ» هم آخر لیست باشد.
-            val count = messages.size + if (isWaitingForReply) 1 else 0
-            if (count > 0) listState.animateScrollToItem(count - 1)
-        }
+    throw new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
+}
+
+// قفل ساده روی chat_id: تلاش برای insert - چون chat_id همان‌جا primary
+// key است، دو تلاش هم‌زمان فقط یکی‌شان موفق می‌شود (رقابت واقعی روی
+// سطح دیتابیس حل می‌شود، نه فقط با چک‌کردن قبلی که خودش race دارد).
+async function acquireLock(chatId, byEmail) {
+    // قفل بیات (locked_at خیلی قدیمی) یعنی درخواست قبلی کرش/تایم‌اوت
+    // کرده؛ آزادش می‌کنیم تا این چت برای همیشه گیر نکند.
+    await supaFetch(
+        `shared_chat_locks?chat_id=eq.${encodeURIComponent(chatId)}&locked_at=lt.${Date.now() - LOCK_STALE_MS}`,
+        { method: 'DELETE' }
+    );
+
+    const resp = await supaFetch('shared_chat_locks', {
+        method: 'POST',
+        body: JSON.stringify([{ chat_id: chatId, locked_by: byEmail, locked_at: Date.now() }])
+    });
+    return resp.ok; // 201 یعنی قفل گرفته شد؛ 409 (unique violation) یعنی یکی دیگر مشغول است
+}
+
+async function releaseLock(chatId) {
+    await supaFetch(`shared_chat_locks?chat_id=eq.${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+}
+
+async function insertMessage(chatId, role, senderEmail, text) {
+    const resp = await supaFetch('shared_chat_messages', {
+        method: 'POST',
+        headers: { 'Prefer': 'return=representation' },
+        body: JSON.stringify([{
+            chat_id: chatId,
+            role,
+            sender_email: senderEmail || null,
+            text,
+            created_at: Date.now()
+        }])
+    });
+    const rows = await resp.json().catch(() => null);
+    return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
+module.exports = async function handler(req, res) {
+    setCors(res);
+
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
     }
 
-    // Polling loop: هر ۲ ثانیه پیام‌های جدید را می‌گیرد. وقتی پیام جدیدی
-    // با role="model" برسد، isWaitingForReply خودکار خاموش می‌شود.
-    LaunchedEffect(chatId) {
-        while (true) {
-            val newOnes = SharedChatApiClient.pollMessages(context, chatId, lastId)
-            if (newOnes.isNotEmpty()) {
-                messages = mergeMessages(messages, newOnes)
-                lastId = maxOf(lastId, newOnes.maxOf { it.id })
-                if (newOnes.any { it.role == "model" }) {
-                    isWaitingForReply = false
-                }
-                scrollToBottom()
-            }
-            delay(POLL_INTERVAL_MS)
-        }
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+        return res.status(500).json({ error: 'سرور برای چت مشترک تنظیم نشده (SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY موجود نیست).' });
     }
 
-    fun sendCurrentInput() {
-        val text = inputText.trim()
-        val imageUris = pendingImageUris.toList()
-        // پیام فقط-عکس (بدون متن) هم مجاز است (سرور هم همین را می‌پذیرد).
-        if ((text.isEmpty() && imageUris.isEmpty()) || isSending) return
+    const email = await verifySessionToken(getBearerToken(req));
+    if (!email) {
+        return res.status(401).json({ error: 'ورود تأیید نشد. دوباره وارد شو.' });
+    }
 
-        inputText = ""
-        pendingImageUris.clear()
-        isSending = true
-        isWaitingForReply = true
+    try {
+        // ===== GET: لیست چت‌های مشترک کاربر، یا پیام‌های جدید یک چت =====
+        if (req.method === 'GET') {
+            const chatId = req.query?.chatId;
 
-        // فوری و optimistic پیام کاربر را نشان می‌دهیم (با عکس‌های محلی).
-        val tempId = nextTempId
-        nextTempId -= 1
-        messages = messages + SharedChatMessage(
-            id = tempId, role = "user", text = text, senderEmail = myEmail,
-            localImageUris = imageUris.map { it.toString() }
-        )
-        scrollToBottom()
-
-        coroutineScope.launch {
-            // ۱) آپلود عکس‌ها (به‌ترتیب). اگر یکی شکست خورد، کل ارسال لغو می‌شود
-            // و متن/عکس‌ها به کاربر برمی‌گردند - نه اینکه پیام بدون عکس برود
-            // و کاربر فکر کند عکس هم رفته.
-            val uploaded = mutableListOf<UploadedImage>()
-            for (uri in imageUris) {
-                val attached = uriToAttachedImage(context, uri)
-                val up = attached?.let {
-                    SharedChatApiClient.uploadImage(context, chatId, it.base64Data, it.mimeType, it.fileName)
+            // ----- دانلود یک عکس: فقط اعضا، و فقط مسیری که واقعاً به همین چت ثبت شده -----
+            if (req.query?.action === 'download') {
+                const path = String(req.query?.path || '');
+                if (!chatId || !path) {
+                    return res.status(400).json({ error: 'chatId یا path مشخص نشده.' });
                 }
-                if (up == null) {
-                    val why = if (attached == null) "خواندن عکس ممکن نشد." else (SharedChatApiClient.lastError ?: "آپلود عکس ناموفق بود.")
-                    Toast.makeText(context, why, Toast.LENGTH_LONG).show()
-                    // برگرداندن وضعیت: پیام optimistic حذف، ورودی و عکس‌ها بازیابی
-                    messages = messages.filter { it.id != tempId }
-                    inputText = text
-                    imageUris.forEach { u -> if (u !in pendingImageUris) pendingImageUris.add(u) }
-                    isSending = false
-                    isWaitingForReply = false
-                    return@launch
+                if (!(await isParticipant(chatId, email))) {
+                    return res.status(403).json({ error: 'عضو این گفتگوی مشترک نیستی.' });
                 }
-                uploaded.add(up)
+                // فقط پیشوند مسیر کافی نیست: مسیر باید دقیقاً در جدول ضمیمه‌ها برای
+                // همین chat_id ثبت شده باشد، وگرنه یک عضو می‌توانست مسیر یک چت دیگر را بخواهد.
+                const regResp = await supaFetch(
+                    `shared_chat_attachments?chat_id=eq.${encodeURIComponent(chatId)}&storage_path=eq.${encodeURIComponent(path)}&select=content_type`
+                );
+                const regRows = regResp.ok ? await regResp.json() : [];
+                if (!Array.isArray(regRows) || !regRows.length) {
+                    return res.status(404).json({ error: 'فایل پیدا نشد.' });
+                }
+                const storageResp = await downloadFromStorage(path);
+                if (!storageResp.ok) return res.status(404).json({ error: 'فایل پیدا نشد.' });
+                const base64 = Buffer.from(await storageResp.arrayBuffer()).toString('base64');
+                return res.status(200).json({ base64, contentType: regRows[0].content_type });
             }
 
-            // ۲) ارسال پیام (+مسیر عکس‌ها)
-            val result = SharedChatApiClient.sendMessage(context, chatId, text, uploaded)
-            isSending = false
+            if (chatId) {
+                if (!(await isParticipant(chatId, email))) {
+                    return res.status(403).json({ error: 'عضو این گفتگوی مشترک نیستی.' });
+                }
+                const since = Number(req.query?.since) || 0;
+                const msgsResp = await supaFetch(
+                    `shared_chat_messages?chat_id=eq.${encodeURIComponent(chatId)}&id=gt.${since}&select=*&order=id.asc&limit=${MAX_MESSAGES_PER_POLL}`
+                );
+                const messages = await msgsResp.json();
+                const list = Array.isArray(messages) ? messages : [];
+                const attMap = await fetchAttachmentsForMessages(list.map(m => m.id));
+                for (const m of list) m.attachments = attMap[m.id] || [];
+                return res.status(200).json({ messages: list });
+            }
 
-            if (result.userMessage != null) {
-                messages = messages.filter { it.id != tempId }
-                messages = mergeMessages(messages, listOf(result.userMessage))
-                lastId = maxOf(lastId, result.userMessage.id)
-                // فایل‌های محلی دیگر لازم نیستند (عکس واقعی حالا روی سرور است)
-                imageUris.forEach { MediaPersist.discard(it) }
+            // لیست چت‌هایی که کاربر عضوشان است - از participants شروع
+            // می‌کنیم (نه از shared_chats) چون معیار دسترسی عضویت است، نه
+            // مالکیت.
+            const partResp = await supaFetch(
+                `shared_chat_participants?email=eq.${encodeURIComponent(email)}&select=chat_id`
+            );
+            const partRows = await partResp.json();
+            const chatIds = Array.isArray(partRows) ? partRows.map(r => r.chat_id) : [];
+            if (!chatIds.length) {
+                return res.status(200).json({ items: [] });
+            }
+            const idsFilter = chatIds.map(id => encodeURIComponent(id)).join(',');
+            const chatsResp = await supaFetch(
+                `shared_chats?chat_id=in.(${idsFilter})&select=chat_id,title,owner_email,invite_code,model,updated_at&order=updated_at.desc`
+            );
+            const chats = await chatsResp.json();
+            return res.status(200).json({ items: Array.isArray(chats) ? chats : [] });
+        }
+
+        if (req.method !== 'POST') {
+            return res.status(405).json({ error: 'متد پشتیبانی نمی‌شود.' });
+        }
+
+        const action = req.query?.action;
+
+        // ===== POST action=create: ساخت چت مشترک جدید =====
+        if (action === 'create') {
+            const countResp = await supaFetch(
+                `shared_chat_participants?email=eq.${encodeURIComponent(email)}&select=chat_id`,
+                { headers: { 'Prefer': 'count=exact' } }
+            );
+            const countHeader = countResp.headers.get('content-range');
+            const currentCount = countHeader ? parseInt(countHeader.split('/')[1], 10) || 0 : 0;
+            if (currentCount >= MAX_SHARED_CHATS_PER_USER) {
+                return res.status(403).json({ error: `حداکثر ${MAX_SHARED_CHATS_PER_USER} گفتگوی مشترک مجاز است.` });
+            }
+
+            const chatId = generateChatId();
+            const inviteCode = generateInviteCode();
+            const now = Date.now();
+            const title = String(req.body?.title || 'گفتگوی مشترک').slice(0, 200);
+
+            // مدل فقط اینجا (توسط سازنده) تعیین می‌شود و بعداً هیچ endpointی
+            // اجازه‌ی تغییرش را ندارد؛ مدل نامعتبر رد می‌شود (نه اینکه بی‌صدا
+            // جایگزین شود) تا کلاینت بفهمد چه اتفاقی افتاده.
+            const requestedModel = req.body?.model;
+            if (requestedModel !== undefined && requestedModel !== null && requestedModel !== '' &&
+                !ALLOWED_MODELS.includes(requestedModel)) {
+                return res.status(400).json({ error: 'مدل انتخاب‌شده معتبر نیست.', allowedModels: ALLOWED_MODELS });
+            }
+            const model = requestedModel || DEFAULT_MODEL;
+
+            const createResp = await supaFetch('shared_chats', {
+                method: 'POST',
+                body: JSON.stringify([{
+                    chat_id: chatId,
+                    owner_email: email,
+                    title,
+                    invite_code: inviteCode,
+                    model,
+                    created_at: now,
+                    updated_at: now
+                }])
+            });
+            if (!createResp.ok) {
+                const errBody = await createResp.text().catch(() => '');
+                console.error('[shared-chats] create failed:', errBody);
+                return res.status(500).json({ error: 'ساخت گفتگوی مشترک ناموفق بود.' });
+            }
+
+            await supaFetch('shared_chat_participants', {
+                method: 'POST',
+                body: JSON.stringify([{ chat_id: chatId, email, joined_at: now }])
+            });
+
+            return res.status(200).json({ chatId, inviteCode, title, model });
+        }
+
+        // ===== POST action=join: پیوستن با کد دعوت =====
+        if (action === 'join') {
+            const inviteCode = String(req.body?.inviteCode || '').trim().toUpperCase();
+            if (!inviteCode) {
+                return res.status(400).json({ error: 'کد دعوت مشخص نشده.' });
+            }
+
+            const findResp = await supaFetch(
+                `shared_chats?invite_code=eq.${encodeURIComponent(inviteCode)}&select=chat_id,title,model`
+            );
+            const findRows = await findResp.json();
+            if (!Array.isArray(findRows) || !findRows.length) {
+                return res.status(404).json({ error: 'کد دعوت معتبر نیست.' });
+            }
+            const chatId = findRows[0].chat_id;
+
+            // اگر قبلاً عضو بوده، دوباره اضافه کردن خطا نمی‌دهد (merge-duplicates)
+            // - یعنی می‌شود از کد دعوت هم برای join اول و هم به‌عنوان یک
+            // لینک دعوت قابل استفاده‌ی مکرر برای همان عضو استفاده کرد.
+            await supaFetch('shared_chat_participants', {
+                method: 'POST',
+                headers: { 'Prefer': 'resolution=merge-duplicates' },
+                body: JSON.stringify([{ chat_id: chatId, email, joined_at: Date.now() }])
+            });
+
+            return res.status(200).json({ chatId, title: findRows[0].title, model: findRows[0].model || DEFAULT_MODEL });
+        }
+
+        // ===== POST action=upload: آپلود یک عکس به Supabase Storage (فقط اعضا) =====
+        // آپلود جدا از send است تا بدنه‌ی send سبک بماند و اگر آپلود شکست خورد،
+        // پیام متنی کاربر گیر نکند. فایل تا وقتی همراه یک پیام send نشود
+        // در جدول ضمیمه‌ها ثبت نمی‌شود (پس برای بقیه‌ی اعضا نامرئی است).
+        if (action === 'upload') {
+            const chatId = String(req.body?.chatId || '').trim();
+            if (!chatId) {
+                return res.status(400).json({ error: 'chatId مشخص نشده.' });
+            }
+            if (!(await isParticipant(chatId, email))) {
+                return res.status(403).json({ error: 'عضو این گفتگوی مشترک نیستی.' });
+            }
+            const { base64, contentType, name } = req.body || {};
+            if (!base64 || typeof base64 !== 'string') {
+                return res.status(400).json({ error: 'محتوای عکس (base64) خالی است.' });
+            }
+            if (!ALLOWED_IMAGE_TYPES.includes(contentType)) {
+                return res.status(415).json({ error: 'فقط عکس (PNG، JPEG، WebP، GIF) مجاز است.' });
+            }
+            // پیشوند data:...;base64, اگر بود حذف می‌شود
+            const buffer = Buffer.from(base64.split(',').pop(), 'base64');
+            if (!buffer.length) {
+                return res.status(400).json({ error: 'محتوای عکس خالی یا نامعتبر است.' });
+            }
+            if (buffer.length > MAX_UPLOAD_SIZE) {
+                return res.status(413).json({ error: `حجم عکس بیشتر از ${MAX_UPLOAD_SIZE / (1024 * 1024)} مگابایت مجاز است.` });
+            }
+
+            const objectPath = sharedStoragePath(chatId, name);
+            const uploadResp = await uploadToStorage(objectPath, buffer, contentType);
+            if (!uploadResp.ok) {
+                const errText = await uploadResp.text().catch(() => '');
+                console.error('[shared-chats] uploadToStorage failed:', errText);
+                return res.status(502).json({ error: 'آپلود عکس روی Supabase Storage ناموفق بود.' });
+            }
+            return res.status(200).json({
+                ok: true,
+                path: objectPath,
+                contentType,
+                name: String(name || 'image').slice(0, 150),
+                size: buffer.length
+            });
+        }
+
+        // ===== POST action=send: ارسال پیام + پاسخ ربات =====
+        if (action === 'send') {
+            const chatId = String(req.body?.chatId || '').trim();
+            const text = String(req.body?.text || '').trim();
+            const rawAttachments = Array.isArray(req.body?.attachments) ? req.body.attachments : [];
+            if (!chatId || (!text && !rawAttachments.length)) {
+                return res.status(400).json({ error: 'chatId یا (text/attachments) مشخص نشده.' });
+            }
+            if (text.length > MAX_MESSAGE_CHARS) {
+                return res.status(413).json({ error: `پیام نباید بیشتر از ${MAX_MESSAGE_CHARS} کاراکتر باشد.` });
+            }
+            if (rawAttachments.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+                return res.status(413).json({ error: `حداکثر ${MAX_ATTACHMENTS_PER_MESSAGE} عکس در هر پیام مجاز است.` });
+            }
+            if (!(await isParticipant(chatId, email))) {
+                return res.status(403).json({ error: 'عضو این گفتگوی مشترک نیستی.' });
+            }
+
+            // هر path باید همان چیزی باشد که خود همین چت در upload برگردانده:
+            // پیشوند shared/<chatId>/ اجباری است تا کسی نتواند فایل یک چت دیگر
+            // (یا فایل چت شخصی یک کاربر) را به پیام خودش وصل کند.
+            const requiredPrefix = `shared/${encodeURIComponent(chatId)}/`;
+            const validAttachments = [];
+            for (const att of rawAttachments) {
+                const path = String(att?.path || '');
+                if (!path.startsWith(requiredPrefix) || path.includes('..')) {
+                    return res.status(400).json({ error: 'مسیر عکس نامعتبر است.' });
+                }
+                // وجود فایل واقعی در Storage را تأیید کن (و نوع/حجم را از خود
+                // Storage بخوان، نه از ادعای کلاینت)
+                const headResp = await downloadFromStorage(path);
+                if (!headResp.ok) {
+                    return res.status(400).json({ error: 'یکی از عکس‌ها پیدا نشد؛ دوباره آپلودش کن.' });
+                }
+                const bytes = Buffer.from(await headResp.arrayBuffer());
+                const realType = (headResp.headers.get('content-type') || '').split(';')[0].trim();
+                if (!ALLOWED_IMAGE_TYPES.includes(realType) || bytes.length > MAX_UPLOAD_SIZE) {
+                    return res.status(400).json({ error: 'یکی از عکس‌ها نامعتبر است.' });
+                }
+                validAttachments.push({
+                    path,
+                    contentType: realType,
+                    name: String(att?.name || 'image').slice(0, 150),
+                    size: bytes.length
+                });
+            }
+
+            // پیام کاربر همیشه فوری ذخیره می‌شود (حتی اگر بعداً قفل جواب
+            // ربات را به تعویق بیندازد) - این‌طوری نفر دوم فوراً پیام
+            // نفر اول را در نتیجه‌ی polling بعدی می‌بیند، بدون نیاز به
+            // منتظر ماندن برای جواب ربات.
+            const userMsg = await insertMessage(chatId, 'user', email, text);
+            if (!userMsg) {
+                // فایل‌هایی که همین الان آپلود شده بودند دیگر به هیچ پیامی وصل نمی‌شوند؛ پاکشان کن.
+                await Promise.all(validAttachments.map(a => deleteFromStorage(a.path)));
+                return res.status(500).json({ error: 'ذخیره‌ی پیام ناموفق بود.' });
+            }
+            if (validAttachments.length) {
+                const attResp = await supaFetch('shared_chat_attachments', {
+                    method: 'POST',
+                    body: JSON.stringify(validAttachments.map(a => ({
+                        message_id: userMsg.id,
+                        chat_id: chatId,
+                        storage_path: a.path,
+                        content_type: a.contentType,
+                        file_name: a.name,
+                        size_bytes: a.size,
+                        created_at: Date.now()
+                    })))
+                });
+                if (!attResp.ok) {
+                    console.error('[shared-chats] attachments insert failed:', await attResp.text().catch(() => ''));
+                    // به‌جای اینکه پیام بدون عکس بماند (و کاربر فکر کند عکس رفته)،
+                    // پیام و فایل‌ها را برمی‌داریم و خطا برمی‌گردانیم تا کلاینت دوباره امتحان کند.
+                    await supaFetch(`shared_chat_messages?id=eq.${userMsg.id}`, { method: 'DELETE' });
+                    await Promise.all(validAttachments.map(a => deleteFromStorage(a.path)));
+                    return res.status(500).json({ error: 'ذخیره‌ی عکس‌ها ناموفق بود؛ دوباره امتحان کن.' });
+                }
+                userMsg.attachments = validAttachments.map(a => ({
+                    path: a.path, contentType: a.contentType, name: a.name, size: a.size
+                }));
             } else {
-                // سرور پیام را نگرفت (مثلاً خطای ذخیره‌ی ضمیمه): optimistic را
-                // برمی‌داریم و محتوا را به کاربر برمی‌گردانیم تا دوباره بزند.
-                messages = messages.filter { it.id != tempId }
-                inputText = text
-                imageUris.forEach { u -> if (u !in pendingImageUris) pendingImageUris.add(u) }
+                userMsg.attachments = [];
+            }
+            await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ updated_at: Date.now() })
+            });
+
+            const gotLock = await acquireLock(chatId, email);
+            if (!gotLock) {
+                // یکی دیگر همین الان دارد پیام قبلی را پردازش می‌کند؛ پیام
+                // این کاربر ذخیره شده و در نوبت polling بعدی هم دیده
+                // می‌شود، ولی این درخواست خودش منتظر جواب ربات نمی‌ماند -
+                // کلاینت با همان polling معمولی جواب را می‌بیند وقتی آماده شود.
+                return res.status(200).json({ message: userMsg, botPending: true });
             }
 
-            if (result.botMessage != null) {
-                messages = mergeMessages(messages, listOf(result.botMessage))
-                lastId = maxOf(lastId, result.botMessage.id)
-                isWaitingForReply = false
-                scrollToBottom()
-            } else if (!result.botPending) {
-                isWaitingForReply = false
-                val msg = result.errorMessage ?: "ربات پاسخ نداد. دوباره تلاش کن."
-                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
-            }
-        }
-    }
+            try {
+                const historyResp = await supaFetch(
+                    `shared_chat_messages?chat_id=eq.${encodeURIComponent(chatId)}&select=id,role,sender_email,text&order=id.desc&limit=100`
+                );
+                const historyRowsDesc = await historyResp.json();
+                // از جدید به قدیم گرفتیم (تا limit روی «آخرین ۱۰۰ پیام» اعمال شود)؛ برای prompt برعکس می‌کنیم.
+                const historyRows = Array.isArray(historyRowsDesc) ? historyRowsDesc.reverse() : [];
 
-    // تایم‌اوت ایمنی برای «در حال تایپ».
-    LaunchedEffect(isWaitingForReply) {
-        if (isWaitingForReply) {
-            delay(TYPING_TIMEOUT_MS)
-            isWaitingForReply = false
-        }
-    }
-
-    // همان پس‌زمینه‌ی ChatScreen (گرادینت تیره / رنگ ساده در تم روشن).
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .drawBehind {
-                if (!ThemeState.isLight) {
-                    drawRect(
-                        brush = Brush.verticalGradient(
-                            colors = listOf(
-                                Color(0xFF333333),
-                                Color(0xFF262626),
-                                Color(0xFF1E1E1E),
-                                Color(0xFF151515)
-                            )
-                        )
-                    )
-                } else {
-                    drawRect(color = BgMain)
+                // عکس‌های این پیام‌ها را یک‌جا بگیر و فقط MAX_IMAGES_TO_BOT تای آخر را
+                // واقعاً برای ربات بفرست (بقیه در متن با یک نشانه‌ی «[عکس]» می‌آیند).
+                const attMap = await fetchAttachmentsForMessages(historyRows.map(r => r.id));
+                const allImages = [];
+                for (const row of historyRows) {
+                    for (const att of (attMap[row.id] || [])) allImages.push({ msgId: row.id, att });
                 }
-            }
-            .statusBarsPadding()
-    ) {
-        ChatHeaderBar(
-            onOpenMenu = onBack,
-            onOpenSettings = {},
-            showChatSearch = false,
-            onToggleChatSearch = {},
-            showNotifPanel = false,
-            notifLoading = false,
-            notifItems = emptyList(),
-            onToggleNotifPanel = {},
-            onDismissNotifPanel = {},
-            menuIcon = Icons.AutoMirrored.Outlined.ArrowBack,
-            centerTitle = title,
-            trailingContent = if (!inviteCode.isNullOrBlank()) {
-                {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.clickable {
-                            clipboard.setText(AnnotatedString(inviteCode))
-                            Toast.makeText(context, "کد دعوت کپی شد", Toast.LENGTH_SHORT).show()
+                const sendableImages = new Set(allImages.slice(-MAX_IMAGES_TO_BOT).map(x => x.att.id));
+
+                const historyForPrompt = [];
+                for (const row of historyRows) {
+                    const parts = [];
+                    const label = row.role === 'user' && row.sender_email ? `[${row.sender_email}]: ` : '';
+                    const rowAtts = attMap[row.id] || [];
+                    const bodyText = (row.text || '') + (rowAtts.length && !row.text ? '(عکس فرستاده شد)' : '');
+                    parts.push({ text: `${label}${bodyText}` });
+
+                    for (const att of rowAtts) {
+                        if (!sendableImages.has(att.id)) {
+                            parts.push({ text: '[عکس قدیمی‌تر - برای صرفه‌جویی در حجم، دوباره فرستاده نشد]' });
+                            continue;
                         }
-                    ) {
-                        Text("کد: $inviteCode", color = TextMain, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Icon(Icons.Outlined.ContentCopy, contentDescription = "کپی کد دعوت", tint = TextMuted, modifier = Modifier.size(15.dp))
+                        const imgResp = await downloadFromStorage(att.path);
+                        if (!imgResp.ok) continue;
+                        const b64 = Buffer.from(await imgResp.arrayBuffer()).toString('base64');
+                        parts.push({ inlineData: { mimeType: att.contentType, data: b64 } });
                     }
+                    historyForPrompt.push({ role: row.role === 'model' ? 'model' : 'user', parts });
                 }
-            } else {
-                { Spacer(modifier = Modifier.size(width = 1.dp, height = 26.dp)) }
-            }
-        )
 
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp),
-            contentPadding = PaddingValues(vertical = 8.dp)
-        ) {
-            items(messages, key = { it.id }) { msg ->
-                SharedChatBubble(msg, myEmail = myEmail, chatId = chatId)
-            }
-            if (isWaitingForReply) {
-                item(key = "typing-indicator") {
-                    // همان نقطه‌های پرش‌کننده‌ی چت عادی (سمت چپ چون
-                    // ربات در چیدمان مشترک سمت چپ است).
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp, horizontal = 4.dp),
-                        horizontalArrangement = Arrangement.End
-                    ) {
-                        TypingIndicatorDots(color = TextMain)
-                    }
-                }
+                // مدل ثابت این چت (همان که سازنده موقع create انتخاب کرده)
+                const chatModel = await getChatModel(chatId);
+                const botText = await getBotReply(historyForPrompt, chatModel);
+                const botMsg = await insertMessage(chatId, 'model', null, botText);
+                await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ updated_at: Date.now() })
+                });
+
+                if (botMsg) botMsg.attachments = [];
+                return res.status(200).json({ message: userMsg, botMessage: botMsg });
+            } catch (err) {
+                console.error('[shared-chats] bot reply failed:', err?.message || err);
+                // پیام کاربر خودش با موفقیت ذخیره شده؛ فقط جواب ربات نرسید -
+                // این را جدا اعلام می‌کنیم تا کلاینت پیام کاربر را از دست
+                // ندهد، فقط بگوید «ربات جواب نداد، دوباره امتحان کن».
+                return res.status(502).json({ message: userMsg, error: 'پاسخ ربات دریافت نشد.' });
+            } finally {
+                await releaseLock(chatId);
             }
         }
 
-        ChatComposerBar(
-            isHomeState = false,
-            inputText = inputText,
-            onInputTextChange = { inputText = it },
-            pendingImageUris = pendingImageUris,
-            onRemoveImage = { uri -> pendingImageUris.remove(uri); MediaPersist.discard(uri) },
-            pendingVideoUri = null,
-            pendingVideoThumbnail = null,
-            onRemoveVideo = {},
-            pendingTextFiles = emptyList(),
-            onRemoveTextFile = {},
-            onPickImage = { imagePickerLauncher.launch("image/*") },
-            onPickVideo = {},
-            onPickFile = {},
-            onAttachMenuOpened = {},
-            recentDeviceImages = emptyList(),
-            onPickRecentImage = {},
-            selectedThinkLevel = "off",
-            onThinkLevelChange = {},
-            // مدل قفل است: کسی وسط چت نمی‌تواند عوضش کند؛ onModelChange
-            // عمداً خالی است (تغییر در چت مشترک فقط موقع ساخت ممکن است).
-            selectedModelLabel = fixedModelLabel,
-            selectedModelId = fixedModelId,
-            onModelChange = { _, _ ->
-                Toast.makeText(context, "مدل این چت ثابت است و سازنده‌ی چت انتخابش کرده.", Toast.LENGTH_SHORT).show()
-            },
-            isGenerating = false,
-            isPreparingImage = false,
-            isPreparingVideo = false,
-            isPreparingFile = false,
-            mediaProgress = null,
-            onPrimaryAction = { sendCurrentInput() },
-            placeholderText = "پیام بنویس...",
-            showThinkChip = false,
-            showVideoOption = false,
-            showFileOption = false,
-            allowVoiceWhenEmpty = false
-        )
+        return res.status(400).json({ error: 'action نامعتبر است.' });
+    } catch (err) {
+        console.error('[shared-chats] handler error:', err?.message || err);
+        return res.status(500).json({ error: 'خطای داخلی سرور.', detail: err?.message || String(err) });
     }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun SharedChatBubble(msg: SharedChatMessage, myEmail: String?, chatId: String) {
-    val isModel = msg.role == "model"
-    val isMine = !isModel && myEmail != null && msg.senderEmail.equals(myEmail, ignoreCase = true)
-    // نام فرستنده فقط برای پیام «دیگران» (نه خودم، نه ربات) - همین است که
-    // چت مشترک را از چت تک‌نفره متمایز می‌کند.
-    val otherName = if (!isModel && !isMine) msg.senderEmail?.substringBefore("@") else null
-
-    val clipboard = LocalClipboardManager.current
-    val context = LocalContext.current
-    var showActions by remember { mutableStateOf(false) }
-
-    // چیدمان: خودم و ربات هم‌جهت با چت عادی (اپ RTL: Start=راست)؛
-    // در چت عادی کاربر Start و بات End است. اینجا «خودم» = Start
-    // (همان راست) و دیگران/ربات = End (چپ) تا فرق بین آدم‌ها روشن باشد.
-    val userShape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomEnd = 20.dp, bottomStart = 6.dp)
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-        horizontalArrangement = if (isMine) Arrangement.Start else Arrangement.End
-    ) {
-        if (isModel) {
-            Column(modifier = Modifier.fillMaxWidth(0.85f).widthIn(max = 480.dp).padding(horizontal = 4.dp, vertical = 2.dp)) {
-                val blocks = remember(msg.text) { MessageFormatter.parse(msg.text) }
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    blocks.forEach { block ->
-                        MessageBlockView(block = block, onDownloadCode = { _, _ -> }, onFeatureChipClick = { })
-                    }
-                }
-                // دکمه‌ی کپی مثل چت عادی (فقط کپی؛ دوباره‌تولید در چت
-                // مشترک معنی ندارد چون پیام روی سرور ذخیره می‌شود).
-                Row(modifier = Modifier.padding(top = 4.dp)) {
-                    IconButton(
-                        onClick = {
-                            clipboard.setText(AnnotatedString(msg.text))
-                            Toast.makeText(context, "کپی شد", Toast.LENGTH_SHORT).show()
-                        },
-                        modifier = Modifier.size(30.dp)
-                    ) {
-                        Icon(Icons.Outlined.ContentCopy, contentDescription = "کپی", tint = TextMuted, modifier = Modifier.size(17.dp))
-                    }
-                }
-            }
-        } else {
-            Column(horizontalAlignment = if (isMine) Alignment.Start else Alignment.End) {
-                if (!otherName.isNullOrBlank()) {
-                    Text(
-                        otherName,
-                        color = TextMuted,
-                        fontSize = 11.sp,
-                        modifier = Modifier.padding(bottom = 3.dp, start = 6.dp, end = 6.dp)
-                    )
-                }
-                Box(
-                    modifier = Modifier
-                        .widthIn(max = 320.dp)
-                        .shadow(elevation = 4.dp, shape = userShape, clip = false, ambientColor = Color.Black, spotColor = Color.Black)
-                        .background(Brush.verticalGradient(listOf(BgInputFocused, BgCard)), shape = userShape)
-                        .combinedClickable(onClick = {}, onLongClick = { showActions = !showActions })
-                        .padding(horizontal = 16.dp, vertical = 12.dp)
-                ) {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (msg.attachments.isNotEmpty() || msg.localImageUris.isNotEmpty()) {
-                            SharedChatImages(msg, chatId)
-                        }
-                        if (msg.text.isNotBlank()) {
-                            Text(msg.text, color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.Medium)
-                        }
-                    }
-                }
-                if (showActions && msg.text.isNotBlank()) {
-                    IconButton(
-                        onClick = {
-                            clipboard.setText(AnnotatedString(msg.text))
-                            Toast.makeText(context, "کپی شد", Toast.LENGTH_SHORT).show()
-                            showActions = false
-                        },
-                        modifier = Modifier.size(30.dp)
-                    ) {
-                        Icon(Icons.Outlined.ContentCopy, contentDescription = "کپی", tint = TextMuted, modifier = Modifier.size(17.dp))
-                    }
-                }
-            }
-        }
-    }
-}
-
-
-/** مدل پیش‌فرض اپ (همان چیپ MainActivity) وقتی سرور مدل چت را نفرستاده. */
-internal const val DEFAULT_SHARED_MODEL_ID = "gemini-3.8-flash"
-
-/**
- * مدل‌هایی که سازنده موقع ساخت چت مشترک می‌تواند انتخاب کند. عمداً همان سه
- * مدل چیپ MainActivity (modelOptions) - اگر آنجا مدلی عوض شد، این‌جا هم عوض کن.
- */
-internal val SHARED_CHAT_MODEL_OPTIONS = listOf(
-    Triple("Virtual Bot 1.1", "gemini-3.5-flash-lite", "سریع‌ترین پاسخ‌ها"),
-    Triple("Virtual Bot 1.7", "gemini-3.8-flash", "جدیدترین مدل"),
-    Triple("Virtual Bot 1.3", "gemini-3.1-pro-preview", "مناسب کدنویسی")
-)
-
-/** برچسب خوانا برای id مدل؛ مدل ناشناخته (مثلاً چت قدیمی) خودِ id را نشان می‌دهد. */
-internal fun sharedModelLabel(modelId: String): String =
-    SHARED_CHAT_MODEL_OPTIONS.firstOrNull { it.second == modelId }?.first ?: modelId
-
-/** حالت بارگذاری یک عکس دانلودی. */
-private sealed interface ImageLoadState {
-    object Loading : ImageLoadState
-    object Failed : ImageLoadState
-    class Ready(val bytes: ByteArray) : ImageLoadState
-}
-
-/**
- * عکس‌های یک پیام. برای پیام‌های optimistic از فایل محلی نشان می‌دهد (فوری،
- * بدون دانلود)؛ برای پیام‌های واقعی (خودم یا دیگران) از سرور می‌گیرد.
- */
-@Composable
-private fun SharedChatImages(msg: SharedChatMessage, chatId: String) {
-    val thumbShape = RoundedCornerShape(12.dp)
-
-    // شبکه‌ی ساده‌ی ۲ستونه (بدون FlowRow که هنوز @ExperimentalLayoutApi است).
-    // به‌جای لیستی از lambdaهای @Composable (که inference آن شکننده است)، هر
-    // عکس را با یک «مدل داده‌ی ساده» توصیف می‌کنیم و ردیف‌ها را مستقیم می‌سازیم.
-    // چون سقف ۴ عکس در هر پیام است، حداکثر ۲ ردیف می‌شود.
-    val remote = msg.attachments
-    val local = if (remote.isEmpty()) msg.localImageUris else emptyList()
-    val total = remote.size + local.size
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        var index = 0
-        while (index < total) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (slot in index until minOf(index + 2, total)) {
-                    if (slot < remote.size) {
-                        SharedChatRemoteImage(remote[slot], chatId, thumbShape)
-                    } else {
-                        AsyncImage(
-                            model = Uri.parse(local[slot - remote.size]),
-                            contentDescription = "عکس ارسالی",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.size(140.dp).clip(thumbShape).background(BgCard)
-                        )
-                    }
-                }
-            }
-            index += 2
-        }
-    }
-}
-
-/** یک عکس دانلودی: loading → عکس / خطا. با cache تا با هر recomposition دوباره دانلود نشود. */
-@Composable
-private fun SharedChatRemoteImage(att: SharedChatAttachment, chatId: String, shape: RoundedCornerShape) {
-    val context = LocalContext.current
-    var state by remember(att.path) { mutableStateOf<ImageLoadState>(ImageLoadState.Loading) }
-    LaunchedEffect(att.path) {
-        val cached = SharedImageCache.get(att.path)
-        if (cached != null) {
-            state = ImageLoadState.Ready(cached)
-            return@LaunchedEffect
-        }
-        val img = SharedChatApiClient.downloadImage(context, chatId, att.path)
-        if (img != null) {
-            SharedImageCache.put(att.path, img.bytes)
-            state = ImageLoadState.Ready(img.bytes)
-        } else {
-            state = ImageLoadState.Failed
-        }
-    }
-    Box(
-        modifier = Modifier.size(140.dp).clip(shape).background(BgCard),
-        contentAlignment = Alignment.Center
-    ) {
-        when (val st = state) {
-            is ImageLoadState.Ready -> AsyncImage(
-                model = st.bytes,
-                contentDescription = att.name ?: "عکس",
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
-            ImageLoadState.Loading -> CircularProgressIndicator(
-                modifier = Modifier.size(22.dp), strokeWidth = 2.dp, color = TextMuted
-            )
-            ImageLoadState.Failed -> Text("⚠ عکس بارگذاری نشد", color = TextMuted, fontSize = 11.sp)
-        }
-    }
-}
-
-/**
- * cache حافظه‌ای ساده و سقف‌دار برای عکس‌های دانلودشده (LRU بر اساس مجموع
- * بایت). بدون آن، هر بار که LazyColumn آیتم را دوباره compose می‌کند عکس
- * دوباره از سرور می‌آمد.
- */
-private object SharedImageCache {
-    private const val MAX_BYTES = 24 * 1024 * 1024 // ۲۴MB
-    private val map = object : LinkedHashMap<String, ByteArray>(16, 0.75f, true) {}
-    private var total = 0
-
-    @Synchronized fun get(key: String): ByteArray? = map[key]
-
-    @Synchronized fun put(key: String, value: ByteArray) {
-        map.remove(key)?.let { total -= it.size }
-        map[key] = value
-        total += value.size
-        val it = map.entries.iterator()
-        while (total > MAX_BYTES && it.hasNext()) {
-            val e = it.next()
-            if (e.key == key) continue
-            total -= e.value.size
-            it.remove()
-        }
-    }
-}
+};
