@@ -1039,7 +1039,7 @@ async function streamRoundWithRecovery({ contents, modelName, key, externalSigna
     }
 }
 
-async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, onStep) {
+async function streamBotReplyWithModel(historyForPrompt, model, onChunk, externalSignal, onStep) {
     const geminiKeys = getGeminiKeys();
     if (!geminiKeys.length) throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
 
@@ -1051,6 +1051,7 @@ async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, 
     const searchIntent = looksLikeWebSearchIntent(historyForPrompt.map(x => (x?.parts || []).map(p => p?.text || '').join(' ')).join(' '));
     let accumulatedAnswer = '';
     let workingContents = [...historyForPrompt];
+    let consecutiveUnavailable = 0;
 
     for (let keyIdx = 0; keyIdx < geminiKeys.length; keyIdx++) {
         if (externalSignal?.aborted) return accumulatedAnswer.trim();
@@ -1173,6 +1174,13 @@ async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, 
 
             // خطای سطح‌درخواست (400/413) برای همه‌ی کلیدها یکسان است؛ چرخاندن ۱۲ کلید فقط وقت تلف می‌کند.
             if (classified.category === 'invalid_request' || classified.category === 'request_too_large') break;
+            // 503 «high demand» مشکل کل مدل است نه یک کلید؛ بعد از ۳ کلید پشت‌سرهم بیهوده ۱۲ کلید را نچرخان، برو سراغ مدل جایگزین.
+            if (classified.category === 'provider_unavailable') {
+                consecutiveUnavailable++;
+                if (consecutiveUnavailable >= 3) break;
+            } else {
+                consecutiveUnavailable = 0;
+            }
             markGeminiKeyResult(key, false);
             if (searchState.used && searchState.result?.result) {
                 workingContents = [
@@ -1188,6 +1196,36 @@ async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, 
         `${failures.join(' | ') || 'no attempts'}`
     );
     throw new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
+}
+
+// ===== Model Fallback (همان منطق pages/api/chat.js) =====
+// اگر مدل انتخاب‌شده‌ی چت شلوغ (503) یا ناموجود بود، مدل‌های جایگزین به ترتیب
+// امتحان می‌شوند. چت عادی همین کار را می‌کرد ولی چت مشترک نه، برای همین با
+// «This model is currently experiencing high demand» کاملاً از کار می‌افتاد.
+const SHARED_MODEL_FALLBACKS = {
+    'gemini-3.8-flash': ['gemini-3.6-flash', 'gemini-3.5-flash-lite'],
+    'gemini-3.6-flash': ['gemini-3.5-flash-lite'],
+    'gemini-3.1-pro-preview': ['gemini-3.6-flash', 'gemini-3.5-flash-lite']
+};
+
+async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, onStep) {
+    const primary = model || DEFAULT_MODEL;
+    const modelsToTry = [primary, ...(SHARED_MODEL_FALLBACKS[primary] || [])];
+    let emittedAny = false;
+    const trackedOnChunk = (piece) => { if (piece) emittedAny = true; onChunk(piece); };
+    let lastErr = null;
+    for (let i = 0; i < modelsToTry.length; i++) {
+        if (externalSignal?.aborted) return '';
+        try {
+            if (i > 0) console.warn(`[shared-chats] falling back to model ${modelsToTry[i]} (primary=${primary})`);
+            return await streamBotReplyWithModel(historyForPrompt, modelsToTry[i], trackedOnChunk, externalSignal, onStep);
+        } catch (err) {
+            lastErr = err;
+            // اگر چیزی از پاسخ قبلاً به کاربر رسیده، مدل عوض نکن تا متن تکراری/ناجور نشود.
+            if (emittedAny) throw err;
+        }
+    }
+    throw lastErr || new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
 }
 
 // قفل ساده روی chat_id: تلاش برای insert - چون chat_id همان‌جا primary
@@ -1436,6 +1474,38 @@ module.exports = async function handler(req, res) {
                 name: String(name || 'image').slice(0, 150),
                 size: buffer.length
             });
+        }
+
+        // ===== POST action=setmodel: تغییر مدل یک چت مشترک =====
+        // مطابق طراحی اولیه، فقط سازنده‌ی چت می‌تواند مدل را عوض کند (بقیه فقط
+        // مدل فعلی را می‌بینند). مدل فقط از لیست ALLOWED_MODELS پذیرفته می‌شود.
+        if (action === 'setmodel') {
+            const chatId = String(req.body?.chatId || '').trim();
+            const newModel = String(req.body?.model || '').trim();
+            if (!chatId || !newModel) {
+                return res.status(400).json({ error: 'chatId یا model مشخص نشده.' });
+            }
+            if (!ALLOWED_MODELS.includes(newModel)) {
+                return res.status(400).json({ error: 'مدل انتخاب‌شده معتبر نیست.', allowedModels: ALLOWED_MODELS });
+            }
+            if (!(await isParticipant(chatId, email))) {
+                return res.status(403).json({ error: 'عضو این گفتگوی مشترک نیستی.' });
+            }
+            const ownerResp = await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}&select=owner_email`);
+            const ownerRows = ownerResp.ok ? await ownerResp.json() : [];
+            const ownerEmail = String(ownerRows?.[0]?.owner_email || '').toLowerCase();
+            if (!ownerEmail || ownerEmail !== email) {
+                return res.status(403).json({ error: 'فقط سازنده‌ی چت می‌تواند مدل را عوض کند.' });
+            }
+            const patchResp = await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ model: newModel, updated_at: Date.now() })
+            });
+            if (!patchResp.ok) {
+                console.error('[shared-chats] setmodel failed:', await patchResp.text().catch(() => ''));
+                return res.status(500).json({ error: 'تغییر مدل ناموفق بود.' });
+            }
+            return res.status(200).json({ ok: true, model: newModel });
         }
 
         // ===== POST action=send: ارسال پیام + پاسخ ربات =====
