@@ -465,8 +465,12 @@ function isPermanentNoTextReason(reason) {
 // تمیز می‌کند: نوبت‌های هم‌role مجاور ادغام و نوبت‌های model ابتدایی حذف می‌شوند.
 function normalizeGeminiContents(contents) {
     const out = [];
-    for (const item of Array.isArray(contents) ? contents : []) {
-        if (!item || !Array.isArray(item.parts) || !item.parts.length) continue;
+    for (let item of Array.isArray(contents) ? contents : []) {
+        if (!item || !Array.isArray(item.parts)) continue;
+        // part متنیِ خالی ({text:''}) را Gemini با 400 رد می‌کند
+        const cleanParts = item.parts.filter(p => p && !(Object.keys(p).length === 1 && typeof p.text === 'string' && !p.text.trim()));
+        if (!cleanParts.length) continue;
+        item = { ...item, parts: cleanParts };
         const role = item.role === 'model' ? 'model' : 'user';
         const last = out[out.length - 1];
         const hasFn = item.parts.some(p => p && (p.functionCall || p.functionResponse));
@@ -770,6 +774,8 @@ async function getBotReply(historyForPrompt, model, externalSignal) {
             if (externalSignal?.aborted) throw err;
             const classified = classifyGeminiError(err);
             failures.push(`${geminiKeyLabel(geminiKeys, key)}: ${classified.category === 'timeout' ? 'timeout' : (String(err?.message || err).slice(0, 80) + (err?.status ? ` HTTP ${err.status}` : '') + (err?.rawBody ? ` ${String(err.rawBody).slice(0, 280).replace(/\s+/g, ' ')}` : ''))}`);
+            // خطای سطح‌درخواست (400/413) برای همه‌ی کلیدها یکسان است؛ چرخاندن ۱۲ کلید فقط وقت تلف می‌کند.
+            if (classified.category === 'invalid_request' || classified.category === 'request_too_large') break;
             markGeminiKeyResult(key, false);
             // If a search already happened, the next key must use its result and may not call web_search again.
             if (searchState.used && searchState.result?.result) {
@@ -1054,6 +1060,8 @@ async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, 
                 return accumulatedAnswer.trim();
             }
 
+            // خطای سطح‌درخواست (400/413) برای همه‌ی کلیدها یکسان است؛ چرخاندن ۱۲ کلید فقط وقت تلف می‌کند.
+            if (classified.category === 'invalid_request' || classified.category === 'request_too_large') break;
             markGeminiKeyResult(key, false);
             if (searchState.used && searchState.result?.result) {
                 workingContents = [
