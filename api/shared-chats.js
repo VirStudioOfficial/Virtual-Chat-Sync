@@ -393,6 +393,13 @@ async function streamBotReply(historyForPrompt, model, onChunk) {
                 } else {
                     let fullText = '';
                     let buffer = '';
+                    // FIX: بعضی وقت‌ها یک candidate بدون متن (finishReason
+                    // مثل SAFETY/RECITATION/MAX_TOKENS یا promptFeedback
+                    // بلاک‌شده) برمی‌گردد - قبلاً این حالت فقط پیام مبهم
+                    // «پاسخ استریم بدون متن» می‌داد بدون اینکه معلوم شود
+                    // چرا؛ حالا آخرین finishReason/blockReason دیده‌شده را
+                    // نگه می‌داریم تا در لاگ خطا مشخص باشد.
+                    let lastEmptyReason = null;
                     // Node/Vercel: response.body یک async iterable از Buffer/Uint8Array است
                     // (همون الگویی که خودِ chat.js برای پایپ‌کردن استریم Gemini استفاده می‌کند).
                     for await (const rawChunk of response.body) {
@@ -415,12 +422,22 @@ async function streamBotReply(historyForPrompt, model, onChunk) {
                                 fullText += pieceText;
                                 emittedAny = true;
                                 onChunk(pieceText);
+                            } else {
+                                lastEmptyReason = cand?.finishReason
+                                    || (parsed?.promptFeedback?.blockReason ? `prompt blocked: ${parsed.promptFeedback.blockReason}` : lastEmptyReason);
                             }
                         }
                     }
                     if (fullText.trim()) return fullText;
-                    failures.push(`key#${keyIdx + 1} try${attempt}: پاسخ استریم بدون متن`);
-                    retryable = false;
+                    // FIX: قبلاً همیشه retryable=false بود، یعنی یک 503/۴۲۹
+                    // گذرا که تصادفاً یک استریم خالی برگردانده بود هم دیگر
+                    // روی همان کلید امتحان نمی‌شد. فقط دلایل دائمی (SAFETY،
+                    // RECITATION، بلاک شدن prompt) واقعاً retry نمی‌خواهند؛
+                    // بقیه (finishReason ناشناس یا هیچ‌کدام) را گذرا فرض کن.
+                    const permanentReasons = ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT'];
+                    const isPermanent = lastEmptyReason && permanentReasons.some(r => lastEmptyReason.includes(r));
+                    failures.push(`key#${keyIdx + 1} try${attempt}: پاسخ استریم بدون متن (${lastEmptyReason || 'دلیل نامشخص'})`);
+                    retryable = !isPermanent;
                 }
             } catch (err) {
                 const aborted = err?.name === 'AbortError';
