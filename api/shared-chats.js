@@ -53,30 +53,255 @@ const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif
 // چت پر از عکس، حجم درخواست به Gemini (و زمان پاسخ) بی‌رویه بالا می‌رود.
 const MAX_IMAGES_TO_BOT = 6;
 
-// ===== Gemini engine (اقتباس‌شده از معماری pages/api/chat.js) =====
-// Shared Chat به agent/toolهای چت شخصی نیاز ندارد، اما لایه‌ی ارتباط با Gemini
-// همان اصول را دارد: classify خطا، health-aware key rotation، deadline مشترک،
-// AbortController، retry هوشمند و model fallback.
+// ===== retry پاسخ ربات =====
+// کل بودجه باید از تایم‌اوت خواندن کلاینت (۳۰ثانیه در SharedChatApiClient) و
+// maxDuration تابع ورسل کمتر بماند، وگرنه کلاینت قطع می‌کند و پیام ربات بعداً
+// (بی‌صدا) می‌رسد.
 const MAX_ATTEMPTS_PER_KEY = 2;
-const BOT_PER_CALL_TIMEOUT_MS = 7000;
-const BOT_TOTAL_BUDGET_MIN_MS = 12000;
-const BOT_TOTAL_BUDGET_MAX_MS = 28000;
-const BOT_RETRY_DELAY_MS = 250;
+const BOT_PER_CALL_TIMEOUT_MS = 20 * 1000;
+const BOT_TOTAL_BUDGET_MS = 26 * 1000;
+const BOT_RETRY_DELAY_MS = 800;
 
 // ===== مدل ثابت هر چت مشترک =====
+// فقط مدل‌های این لیست پذیرفته می‌شوند تا کاربر نتواند یک رشته‌ی دلخواه
+// را داخل URL درخواست Gemini بنشاند. اگر مدل‌های موردنظرت فرق دارند،
+// فقط همین لیست را عوض کن (اولین مورد پیش‌فرض است).
+// همان سه مدلی که چیپ انتخاب مدل در اپ (MainActivity modelOptions) نشان
+// می‌دهد. gemini-3.6-flash هم نگه داشته شده چون چت‌های مشترکی که قبل از
+// این فیچر ساخته شده‌اند در دیتابیس همین مقدار را دارند (default ستون).
 const ALLOWED_MODELS = [
-    'gemini-3.8-flash',
-    'gemini-3.5-flash-lite',
-    'gemini-3.1-pro-preview',
-    'gemini-3.6-flash'
+    'gemini-3.8-flash',        // Virtual Bot 1.7 - پیش‌فرض اپ
+    'gemini-3.5-flash-lite',   // Virtual Bot 1.1
+    'gemini-3.1-pro-preview',  // Virtual Bot 1.3
+    'gemini-3.6-flash'         // قدیمی (سازگاری با چت‌های قبلی)
 ];
 const DEFAULT_MODEL = 'gemini-3.8-flash';
 
-function getGeminiKeys() {
-    return (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '')
-        .split(',')
-        .map(k => k.trim())
-        .filter(Boolean);
+function setCors(res) {
+    res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+// ===== همان الگوی api/chats.js: تأیید هویت با session token داخلی =====
+async function verifySessionToken(token) {
+    if (!token) return null;
+    try {
+        const resp = await supaFetch(`sessions?token=eq.${encodeURIComponent(token)}&select=email,expires_at`);
+        if (!resp.ok) return null;
+        const rows = await resp.json();
+        if (!Array.isArray(rows) || !rows.length) return null;
+        const session = rows[0];
+        if (Number(session.expires_at) < Date.now()) return null;
+        return String(session.email).toLowerCase();
+    } catch (err) {
+        console.error('[shared-chats] verifySessionToken threw:', err?.message || err);
+        return null;
+    }
+}
+
+function getBearerToken(req) {
+    const header = req.headers['authorization'] || '';
+    const match = /^Bearer\s+(.+)$/i.exec(header);
+    return match ? match[1] : null;
+}
+
+async function supaFetch(path, options = {}) {
+    return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+        ...options,
+        headers: {
+            'apikey': SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            ...(options.headers || {})
+        }
+    });
+}
+
+function generateChatId() {
+    return crypto.randomBytes(16).toString('hex');
+}
+
+// کد دعوت کوتاه و خوانا (بدون کاراکترهای شبیه‌به‌هم مثل 0/O یا 1/I).
+const INVITE_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function generateInviteCode() {
+    let code = '';
+    for (let i = 0; i < 6; i++) {
+        code += INVITE_CODE_ALPHABET[crypto.randomInt(0, INVITE_CODE_ALPHABET.length)];
+    }
+    return code;
+}
+
+// بررسی می‌کند که این ایمیل واقعاً عضو این چت مشترک است؛ همه‌جا قبل از
+// خواندن/نوشتن صدا زده می‌شود چون این‌جا (برخلاف چت شخصی) مالکیت به
+// چند نفر تعلق دارد، نه فقط owner_email.
+async function isParticipant(chatId, email) {
+    const resp = await supaFetch(
+        `shared_chat_participants?chat_id=eq.${encodeURIComponent(chatId)}&email=eq.${encodeURIComponent(email)}&select=email`
+    );
+    if (!resp.ok) return false;
+    const rows = await resp.json();
+    return Array.isArray(rows) && rows.length > 0;
+}
+
+
+// ===== Storage helpers (Supabase Storage REST) =====
+// مسیر: shared/<chatId>/<timestamp>_<نام امن>. برخلاف چت شخصی، ایمیل
+// آپلودکننده در مسیر نیست چون دسترسی بر اساس عضویت در چت است، نه مالکیت.
+function sharedStoragePath(chatId, fileName) {
+    const safeName = String(fileName || 'image').replace(/[^\w.\-]+/g, '_').slice(0, 100);
+    const rand = crypto.randomBytes(4).toString('hex');
+    return `shared/${encodeURIComponent(chatId)}/${Date.now()}_${rand}_${safeName}`;
+}
+
+async function uploadToStorage(objectPath, buffer, contentType) {
+    return fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
+        method: 'POST',
+        headers: {
+            'apikey': SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': contentType || 'application/octet-stream',
+            'x-upsert': 'false'
+        },
+        body: buffer
+    });
+}
+
+async function downloadFromStorage(objectPath) {
+    return fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
+        headers: {
+            'apikey': SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+        }
+    });
+}
+
+async function deleteFromStorage(objectPath) {
+    // best-effort: اگر پاک نشد، مشکلی برای کاربر پیش نمی‌آید (فقط یک فایل یتیم می‌ماند)
+    try {
+        await fetch(`${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${objectPath}`, {
+            method: 'DELETE',
+            headers: {
+                'apikey': SUPABASE_SERVICE_ROLE_KEY,
+                'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+            }
+        });
+    } catch (_) { /* ignore */ }
+}
+
+// مدل ثابت این چت را از دیتابیس می‌خواند. اگر ستون/ردیف مشکل داشت یا مدل
+// دیگر در لیست مجاز نبود، به پیش‌فرض برمی‌گردیم تا چت از کار نیفتد.
+async function getChatModel(chatId) {
+    try {
+        const resp = await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}&select=model`);
+        if (!resp.ok) return DEFAULT_MODEL;
+        const rows = await resp.json();
+        const model = Array.isArray(rows) && rows[0] && rows[0].model;
+        return ALLOWED_MODELS.includes(model) ? model : DEFAULT_MODEL;
+    } catch (_) {
+        return DEFAULT_MODEL;
+    }
+}
+
+// عکس‌های چند پیام را یک‌جا می‌گیرد و به‌صورت map از message_id -> [attachment] برمی‌گرداند
+// (یک query برای کل batch، نه یک query به ازای هر پیام).
+async function fetchAttachmentsForMessages(messageIds) {
+    const map = {};
+    if (!messageIds.length) return map;
+    const resp = await supaFetch(
+        `shared_chat_attachments?message_id=in.(${messageIds.join(',')})&select=id,message_id,storage_path,content_type,file_name,size_bytes&order=id.asc`
+    );
+    if (!resp.ok) return map;
+    const rows = await resp.json();
+    if (!Array.isArray(rows)) return map;
+    for (const row of rows) {
+        (map[row.message_id] = map[row.message_id] || []).push({
+            id: row.id,
+            path: row.storage_path,
+            contentType: row.content_type,
+            name: row.file_name,
+            size: row.size_bytes
+        });
+    }
+    return map;
+}
+
+// FEATURE (فیچر B - پرامپت بهتر): قبلاً این‌جا فقط ۴ خط بود (نه لحن، نه
+// قوانین قالب‌بندی/لیست، نه چیزی درباره‌ی شماره‌گذاری تودرتو) - برای همین
+// چت مشترک هم لحن خشک‌تری داشت و هم مشکل «بخش ۱، ۱، ۱» (تکرار شماره در
+// لیست‌های تودرتو) که مدل‌های کوچیک بدون راهنمایی صریح بهش دچار می‌شن.
+// این‌جا معادل خلاصه‌شده‌ی بخش «لحن» + «قالب‌بندی» از systemText اصلی
+// chat.js است (نگاه کن به pages/api/chat.js حدود خط ۵۳۶۴-۵۴۴۴)، نه کل
+// آن پرامپت ۲۹هزار کاراکتری (که شامل حافظه/ترجیحات/ویجت/SVG است و چت
+// مشترک فعلاً به هیچ‌کدام نیاز ندارد).
+const SHARED_CHAT_SYSTEM_TEXT =
+    'تو Virtual Bot هستی؛ دستیار هوش مصنوعی گرم، صمیمی و طبیعی به فارسی، مثل صحبت با یک دوست باهوش، نه متن خشک و رسمی.\n' +
+    'در این گفتگو ممکن است بیش از یک نفر با تو صحبت کند - هر پیام کاربر با نام فرستنده مشخص شده؛ ' +
+    'به هر نفر با توجه به کل زمینه‌ی گفتگو پاسخ بده، نه فقط آخرین پیام را جدا از بقیه در نظر بگیر. ' +
+    'اگر دو نفر همزمان موضوع‌های متفاوتی مطرح کرده‌اند، مشخص کن به کدام پیام/کدام فرد پاسخ می‌دهی.\n' +
+    'لحن: رسمی→محترمانه، دوستانه→صمیمی، شوخ→هم‌راستا. محاوره‌ای و روان باش؛ فقط عبارت‌های رایج و طبیعی فارسی. ' +
+    'سؤال ساده کوتاه جواب بده؛ موضوع پیچیده کامل و مرحله‌ای. جمله‌ی اول را طوری نساز که با پاسخ واقعی بعدی تناقض داشته باشد.\n' +
+    'ایموجی را مستقل از رفتار کاربر و طبیعی استفاده کن (لازم نیست کاربر اول ایموجی بزند)؛ در پاسخ‌های رسمی/فنی/جدی ایموجی کم یا اصلاً استفاده نکن؛ ' +
+    'هرگز 🤖 استفاده نکن و از ردیف طولانی ایموجی پرهیز کن.\n' +
+    'قالب‌بندی (فقط وقتی واقعاً لازم است): ایتالیک با *متن* یا _متن_؛ خط‌خورده با ~~متن~~؛ لینک واقعی با [متن](https://...)؛ ' +
+    'جدول مارک‌داون فقط برای داده‌ی واقعاً جدولی.\n' +
+    'قانون شماره‌گذاری لیست تودرتو (مهم): هر سطح فقط یک‌بار شماره/بولت بگیرد - هرگز ننویس «۱. بخش ۱» یا زیر آیتم شماره‌ی «۱» دوباره زیرشماره‌ی «۱.۱» را با پیشوند تکراری تکرار نکن؛ ' +
+    'برای زیرسطح از حروف (الف، ب) یا خط تیره‌ی ساده استفاده کن، نه تکرار همان عدد پدر. لیست تودرتو با ۲ فاصله برای هر سطح تورفتگی داشته باشد.\n' +
+    'ریاضی: درون‌خطی با $...$ و مستقل/بزرگ با $$...$$؛ علامت $ را escape نکن.\n' +
+    'درباره‌ی چیزهایی که نمی‌دانی اطلاعات ساختگی نده و بگو مطمئن نیستی.';
+
+// ===== Gemini engine (Shared Chat) =====
+// این بخش عمداً فقط موتور ارتباط با Gemini را مدیریت می‌کند. تمام قابلیت‌های
+// Shared Chat (احراز هویت، Supabase، دعوت، آپلود، history، lock، send و stream)
+// بیرون از این بلوک دست‌نخورده باقی می‌مانند.
+//
+// تفاوت اصلی با نسخه‌ی قبلی:
+// 1) به‌جای گیر کردن روی یک کلید به مدت 20 ثانیه، هر تلاش deadline مستقل و کوتاه دارد.
+// 2) کلیدها بر اساس health/error count مرتب می‌شوند و خطای یک کلید کل pool را متوقف نمی‌کند.
+// 3) برای خطاهای گذرا (503/429/timeout/network/401/403/404) سریع به کلید بعدی می‌رویم.
+// 4) سقف کل زمان request همچنان زیر timeout کلاینت Shared Chat نگه داشته می‌شود.
+// 5) در stream اگر قبل از قطع اتصال متن واقعی به کلاینت رسیده باشد، پاسخ دوباره از اول
+//    روی کلید دیگری شروع نمی‌شود؛ متن موجود به‌عنوان پاسخ نهایی حفظ می‌شود تا duplicate نشود.
+
+const GEMINI_KEY_FAILURE_COUNTS = new Map();
+
+// The original Shared Chat constants stay intact for compatibility, but the
+// effective Gemini attempt cap is deliberately shorter. A single 20s timeout
+// on one key must never consume almost the entire 26s request budget and
+// prevent the remaining keys from being tried.
+const SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS = Math.min(
+    BOT_PER_CALL_TIMEOUT_MS,
+    4500
+);
+const SHARED_GEMINI_MIN_REMAINING_MS = 1200;
+
+function rotateGeminiKeysByHealth(keys) {
+    const shuffled = keys
+        .map(key => ({ key, order: Math.random() }))
+        .sort((a, b) => a.order - b.order)
+        .map(({ key }) => key);
+
+    return shuffled.sort((a, b) => {
+        const fa = GEMINI_KEY_FAILURE_COUNTS.get(a) || 0;
+        const fb = GEMINI_KEY_FAILURE_COUNTS.get(b) || 0;
+        return fa - fb;
+    });
+}
+
+function markGeminiKeyResult(key, ok) {
+    if (ok) {
+        GEMINI_KEY_FAILURE_COUNTS.set(key, 0);
+        return;
+    }
+    GEMINI_KEY_FAILURE_COUNTS.set(
+        key,
+        (GEMINI_KEY_FAILURE_COUNTS.get(key) || 0) + 1
+    );
+}
+
+function geminiKeyLabel(keys, key) {
+    const index = keys.indexOf(key);
+    return `key#${index + 1}/${keys.length}`;
 }
 
 function classifyGeminiError(error) {
@@ -87,11 +312,14 @@ function classifyGeminiError(error) {
         error?.body?.error?.code ??
         0
     ) || null;
-    const providerCode =
+
+    const providerCode = String(
         error?.error?.status ||
         error?.body?.error?.status ||
         error?.statusText ||
-        null;
+        ''
+    ).trim() || null;
+
     const rawMessage = String(
         error?.message ||
         error?.error?.message ||
@@ -99,15 +327,26 @@ function classifyGeminiError(error) {
         error?.body?.error?.message ||
         ''
     ).trim();
+
     const normalized = `${providerCode || ''} ${rawMessage}`.toLowerCase();
 
     if (error?.name === 'AbortError' || /timeout|timed out|deadline exceeded/.test(normalized)) {
-        return { category: 'timeout', retryable: true, keySpecific: false, status, providerCode, rawMessage };
-    }
-    if (status === 429 || /resource_exhausted|quota|rate.?limit|too many requests/.test(normalized)) {
-        const quota = /free.?tier|daily.?quota|quota.?exceeded|exceeded your current quota/.test(normalized);
         return {
-            category: quota ? 'quota_exhausted' : 'rate_limit',
+            category: 'timeout',
+            retryable: true,
+            keySpecific: false,
+            status,
+            providerCode,
+            rawMessage
+        };
+    }
+
+    if (
+        status === 429 ||
+        /resource_exhausted|quota|rate.?limit|too many requests/.test(normalized)
+    ) {
+        return {
+            category: 'rate_limit_or_quota',
             retryable: true,
             keySpecific: true,
             status: status || 429,
@@ -115,295 +354,421 @@ function classifyGeminiError(error) {
             rawMessage
         };
     }
-    if (status === 401 || /api key|invalid.*key|unauthenticated|authentication/.test(normalized)) {
-        return { category: 'invalid_api_key', retryable: true, keySpecific: true, status: status || 401, providerCode, rawMessage };
-    }
-    if (status === 403 || /permission|forbidden|access denied|not authorized/.test(normalized)) {
-        return { category: 'permission_denied', retryable: true, keySpecific: true, status: status || 403, providerCode, rawMessage };
-    }
-    if (status === 404 || /model.*not found|not_found|unknown model/.test(normalized)) {
-        return { category: 'model_not_found', retryable: true, keySpecific: false, status: status || 404, providerCode, rawMessage };
-    }
-    if (status === 400 || /invalid argument|invalid request|bad request|malformed/.test(normalized)) {
-        return { category: 'invalid_request', retryable: false, keySpecific: false, status: status || 400, providerCode, rawMessage };
-    }
-    if (status === 413 || /too large|payload.*large|request.*size|token limit|context length/.test(normalized)) {
-        return { category: 'request_too_large', retryable: false, keySpecific: false, status: status || 413, providerCode, rawMessage };
-    }
-    if ((status >= 500 && status <= 599) || /service unavailable|internal server error|bad gateway|temporarily unavailable/.test(normalized)) {
-        return { category: 'provider_unavailable', retryable: true, keySpecific: false, status, providerCode, rawMessage };
-    }
-    if (error instanceof TypeError || /fetch failed|network|socket|econn|enotfound|connection/.test(normalized)) {
-        return { category: 'network_error', retryable: true, keySpecific: false, status, providerCode, rawMessage };
-    }
-    return { category: 'unknown_error', retryable: true, keySpecific: false, status, providerCode, rawMessage };
-}
 
-// Per-process health state; intentionally stores the key itself only in memory.
-// Nothing here is logged or persisted.
-const __sharedKeyFailureCounts = new Map();
-
-function rotateKeysByHealth(keys) {
-    const shuffled = keys
-        .map(k => ({ k, r: Math.random() }))
-        .sort((a, b) => a.r - b.r)
-        .map(x => x.k);
-    return shuffled.sort((a, b) =>
-        (__sharedKeyFailureCounts.get(a) || 0) - (__sharedKeyFailureCounts.get(b) || 0)
-    );
-}
-
-function markKeyResult(key, ok) {
-    if (ok) __sharedKeyFailureCounts.set(key, 0);
-    else __sharedKeyFailureCounts.set(key, (__sharedKeyFailureCounts.get(key) || 0) + 1);
-}
-
-function keyLabel(keys, key) {
-    return `key#${keys.indexOf(key) + 1}/${keys.length}`;
-}
-
-function getModelFallbacks(model) {
-    const selected = ALLOWED_MODELS.includes(model) ? model : DEFAULT_MODEL;
-    const fallbacks = [selected];
-    if (selected === 'gemini-3.1-pro-preview') {
-        fallbacks.push('gemini-3.8-flash', 'gemini-3.5-flash-lite');
-    } else if (selected === 'gemini-3.8-flash' || selected === 'gemini-3.6-flash') {
-        fallbacks.push('gemini-3.5-flash-lite');
+    if (
+        status === 401 ||
+        /api key|invalid.*key|unauthenticated|authentication/.test(normalized)
+    ) {
+        return {
+            category: 'invalid_api_key',
+            retryable: true,
+            keySpecific: true,
+            status: status || 401,
+            providerCode,
+            rawMessage
+        };
     }
-    return [...new Set(fallbacks)];
-}
 
-function getBotDeadlineMs(keyCount, modelCount = 1) {
-    // Unlike chat.js, Shared Chat's HTTP client historically expects a short
-    // response window. We therefore copy the architecture, but keep the
-    // deadline below that client ceiling. More keys/models get more budget,
-    // but never beyond BOT_TOTAL_BUDGET_MAX_MS.
-    const attempts = Math.max(1, keyCount * modelCount);
-    return Math.min(
-        BOT_TOTAL_BUDGET_MAX_MS,
-        Math.max(BOT_TOTAL_BUDGET_MIN_MS, 3500 + attempts * 1800)
-    );
-}
+    if (
+        status === 403 ||
+        /permission|forbidden|access denied|not authorized/.test(normalized)
+    ) {
+        return {
+            category: 'permission_denied',
+            retryable: true,
+            keySpecific: true,
+            status: status || 403,
+            providerCode,
+            rawMessage
+        };
+    }
 
-function makeGeminiRequestBody(historyForPrompt) {
+    if (
+        status === 404 ||
+        /model.*not found|not_found|unknown model/.test(normalized)
+    ) {
+        return {
+            category: 'model_not_found',
+            retryable: true,
+            keySpecific: false,
+            status: status || 404,
+            providerCode,
+            rawMessage
+        };
+    }
+
+    if (
+        status === 400 ||
+        /invalid argument|invalid request|bad request|malformed/.test(normalized)
+    ) {
+        return {
+            category: 'invalid_request',
+            retryable: false,
+            keySpecific: false,
+            status: status || 400,
+            providerCode,
+            rawMessage
+        };
+    }
+
+    if (
+        status === 413 ||
+        /too large|payload.*large|request.*size|token limit|context length/.test(normalized)
+    ) {
+        return {
+            category: 'request_too_large',
+            retryable: false,
+            keySpecific: false,
+            status: status || 413,
+            providerCode,
+            rawMessage
+        };
+    }
+
+    if (
+        (status >= 500 && status <= 599) ||
+        /service unavailable|internal server error|bad gateway|temporarily unavailable/.test(normalized)
+    ) {
+        return {
+            category: 'provider_unavailable',
+            retryable: true,
+            keySpecific: false,
+            status,
+            providerCode,
+            rawMessage
+        };
+    }
+
+    if (
+        error instanceof TypeError ||
+        /fetch failed|network|socket|econn|enotfound|connection/.test(normalized)
+    ) {
+        return {
+            category: 'network_error',
+            retryable: true,
+            keySpecific: false,
+            status,
+            providerCode,
+            rawMessage
+        };
+    }
+
     return {
-        systemInstruction: { parts: [{ text: SHARED_CHAT_SYSTEM_TEXT }] },
+        category: 'unknown_error',
+        retryable: true,
+        keySpecific: false,
+        status,
+        providerCode,
+        rawMessage
+    };
+}
+
+async function readGeminiErrorBody(response) {
+    const raw = await response.text().catch(() => '');
+    let parsed = null;
+    if (raw) {
+        try { parsed = JSON.parse(raw); } catch (_) {}
+    }
+    return { raw, parsed };
+}
+
+function getGeminiKeys() {
+    return rotateGeminiKeysByHealth(
+        (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '')
+            .split(',')
+            .map(k => k.trim())
+            .filter(Boolean)
+    );
+}
+
+function buildGeminiRequestBody(historyForPrompt) {
+    return {
+        system_instruction: { parts: [{ text: SHARED_CHAT_SYSTEM_TEXT }] },
         contents: historyForPrompt
     };
 }
 
-function parseGeminiText(data) {
-    return data?.candidates?.[0]?.content?.parts?.map(p => p?.text || '').join('') || '';
+function extractGeminiText(data) {
+    const parts = data?.candidates?.[0]?.content?.parts;
+    if (!Array.isArray(parts)) return '';
+    return parts.map(p => p?.text || '').join('');
 }
 
-function makeHttpGeminiError(status, bodyText) {
-    let parsed = null;
-    try { parsed = JSON.parse(bodyText); } catch (_) {}
-    const err = new Error(parsed?.error?.message || `HTTP ${status}`);
-    err.status = status;
-    err.statusText = parsed?.error?.status || null;
-    err.body = parsed;
-    return err;
+function isPermanentNoTextReason(reason) {
+    const value = String(reason || '').toUpperCase();
+    return ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT'].some(r => value.includes(r));
 }
 
-function isPermanentEmptyReason(reason) {
-    return ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT'].some(x => String(reason || '').includes(x));
-}
-
+// ===== پاسخ غیر-استریمی برای کلاینت‌های قدیمی =====
 async function getBotReply(historyForPrompt, model) {
-    const keys = getGeminiKeys();
-    if (!keys.length) throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
+    const geminiKeys = getGeminiKeys();
+    if (!geminiKeys.length) {
+        throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
+    }
 
-    const models = getModelFallbacks(model);
     const startedAt = Date.now();
-    const overallDeadline = startedAt + getBotDeadlineMs(keys.length, models.length);
     const failures = [];
-    let lastError = null;
+    const modelName = model || DEFAULT_MODEL;
 
-    outer:
-    for (const currentModel of models) {
-        const orderedKeys = rotateKeysByHealth(keys);
-        for (const currentKey of orderedKeys) {
-            if (Date.now() >= overallDeadline) break outer;
-            for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_KEY; attempt++) {
-                const remaining = Math.max(0, overallDeadline - Date.now());
-                if (remaining < 1000) break outer;
+    for (let keyIdx = 0; keyIdx < geminiKeys.length; keyIdx++) {
+        const key = geminiKeys[keyIdx];
+        const remainingBeforeAttempt = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
+        if (remainingBeforeAttempt < SHARED_GEMINI_MIN_REMAINING_MS) break;
 
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), Math.min(BOT_PER_CALL_TIMEOUT_MS, remaining));
-                try {
-                    const response = await fetch(
-                        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(currentModel)}:generateContent`,
-                        {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'x-goog-api-key': currentKey
-                            },
-                            body: JSON.stringify(makeGeminiRequestBody(historyForPrompt)),
-                            signal: controller.signal
-                        }
-                    );
-                    if (!response.ok) {
-                        const body = await response.text().catch(() => '');
-                        const err = makeHttpGeminiError(response.status, body);
-                        const classified = classifyGeminiError(err);
-                        failures.push(`${keyLabel(keys, currentKey)} try${attempt}: HTTP ${response.status} ${body.slice(0, 240).replace(/\s+/g, ' ')}`);
-                        lastError = err;
-                        if (classified.keySpecific) markKeyResult(currentKey, false);
-                        if (!classified.retryable) break;
-                        continue;
-                    }
+        const attemptTimeoutMs = Math.min(
+            SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS,
+            Math.max(1000, remainingBeforeAttempt - 250)
+        );
 
-                    const data = await response.json();
-                    const text = parseGeminiText(data).trim();
-                    if (text) {
-                        markKeyResult(currentKey, true);
-                        return text;
-                    }
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
 
-                    const cand = data?.candidates?.[0];
-                    const reason = cand?.finishReason || (data?.promptFeedback?.blockReason ? `prompt blocked: ${data.promptFeedback.blockReason}` : 'no candidates');
-                    failures.push(`${keyLabel(keys, currentKey)} try${attempt}: پاسخ بدون متن (${reason})`);
-                    if (isPermanentEmptyReason(reason)) break;
-                    markKeyResult(currentKey, false);
-                } catch (err) {
-                    const classified = classifyGeminiError(err);
-                    failures.push(`${keyLabel(keys, currentKey)} try${attempt}: ${classified.category}${classified.rawMessage ? ` (${classified.rawMessage})` : ''}`);
-                    lastError = err;
-                    if (classified.keySpecific) markKeyResult(currentKey, false);
-                    if (!classified.retryable) break;
-                } finally {
-                    clearTimeout(timeoutId);
+        try {
+            const response = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-goog-api-key': key
+                    },
+                    body: JSON.stringify(buildGeminiRequestBody(historyForPrompt)),
+                    signal: controller.signal
                 }
+            );
 
-                if (attempt < MAX_ATTEMPTS_PER_KEY && Date.now() < overallDeadline) {
-                    await new Promise(resolve => setTimeout(resolve, BOT_RETRY_DELAY_MS * attempt));
-                }
+            if (!response.ok) {
+                const errorBody = await readGeminiErrorBody(response);
+                const classified = classifyGeminiError({
+                    status: response.status,
+                    statusText: response.statusText,
+                    body: errorBody.parsed,
+                    message: errorBody.parsed?.error?.message || errorBody.raw
+                });
+
+                failures.push(
+                    `${geminiKeyLabel(geminiKeys, key)}: HTTP ${response.status} ` +
+                    `${errorBody.raw.slice(0, 300).replace(/\s+/g, ' ')}`
+                );
+                markGeminiKeyResult(key, false);
+
+                if (!classified.retryable) break;
+                continue;
             }
+
+            const data = await response.json();
+            const text = extractGeminiText(data).trim();
+
+            if (text) {
+                markGeminiKeyResult(key, true);
+                return text;
+            }
+
+            const candidate = data?.candidates?.[0];
+            const why = candidate?.finishReason ||
+                (data?.promptFeedback?.blockReason
+                    ? `prompt blocked: ${data.promptFeedback.blockReason}`
+                    : 'no candidates');
+
+            failures.push(
+                `${geminiKeyLabel(geminiKeys, key)}: پاسخ بدون متن (${String(why).slice(0, 180)})`
+            );
+
+            // پاسخ 200 اما بدون متن معمولاً با همان ورودی تکرارپذیر است؛
+            // مگر این‌که دلیل ناشناخته باشد که ممکن است گذرا بوده باشد.
+            if (isPermanentNoTextReason(why)) {
+                markGeminiKeyResult(key, true);
+                break;
+            }
+            markGeminiKeyResult(key, false);
+        } catch (err) {
+            const classified = classifyGeminiError(err);
+            failures.push(
+                `${geminiKeyLabel(geminiKeys, key)}: ${
+                    classified.category === 'timeout'
+                        ? 'timeout'
+                        : (err?.message || String(err)).slice(0, 180)
+                }`
+            );
+            markGeminiKeyResult(key, false);
+        } finally {
+            clearTimeout(timeoutId);
         }
     }
 
-    const classified = classifyGeminiError(lastError || new Error('Gemini deadline exceeded'));
     console.error(
-        `[shared-chats] Gemini failed (models=${models.join(',')}, ${Date.now() - startedAt}ms, category=${classified.category}): ${failures.join(' | ') || 'no attempts'}`
+        `[shared-chats] Gemini failed (model=${modelName}, ${Date.now() - startedAt}ms): ` +
+        `${failures.join(' | ') || 'no attempts'}`
     );
     throw new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
 }
 
+// ===== پاسخ استریمی =====
 async function streamBotReply(historyForPrompt, model, onChunk) {
-    const keys = getGeminiKeys();
-    if (!keys.length) throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
+    const geminiKeys = getGeminiKeys();
+    if (!geminiKeys.length) {
+        throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
+    }
 
-    const models = getModelFallbacks(model);
     const startedAt = Date.now();
-    const overallDeadline = startedAt + getBotDeadlineMs(keys.length, models.length);
     const failures = [];
-    let lastError = null;
+    const modelName = model || DEFAULT_MODEL;
+    let emittedText = '';
 
-    outer:
-    for (const currentModel of models) {
-        const orderedKeys = rotateKeysByHealth(keys);
-        for (const currentKey of orderedKeys) {
-            if (Date.now() >= overallDeadline) break outer;
-            for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_KEY; attempt++) {
-                const remaining = Math.max(0, overallDeadline - Date.now());
-                if (remaining < 1000) break outer;
+    for (let keyIdx = 0; keyIdx < geminiKeys.length; keyIdx++) {
+        const key = geminiKeys[keyIdx];
+        const remainingBeforeAttempt = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
+        if (remainingBeforeAttempt < SHARED_GEMINI_MIN_REMAINING_MS) break;
 
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), Math.min(BOT_PER_CALL_TIMEOUT_MS, remaining));
-                let emittedAny = false;
-                let fullText = '';
-                let buffer = '';
-                let lastEmptyReason = null;
+        const attemptTimeoutMs = Math.min(
+            SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS,
+            Math.max(1000, remainingBeforeAttempt - 250)
+        );
 
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
+        let fullText = '';
+        let emittedThisAttempt = false;
+
+        try {
+            const response = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:streamGenerateContent?alt=sse`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-goog-api-key': key
+                    },
+                    body: JSON.stringify(buildGeminiRequestBody(historyForPrompt)),
+                    signal: controller.signal
+                }
+            );
+
+            if (!response.ok) {
+                const errorBody = await readGeminiErrorBody(response);
+                const classified = classifyGeminiError({
+                    status: response.status,
+                    statusText: response.statusText,
+                    body: errorBody.parsed,
+                    message: errorBody.parsed?.error?.message || errorBody.raw
+                });
+
+                failures.push(
+                    `${geminiKeyLabel(geminiKeys, key)}: HTTP ${response.status} ` +
+                    `${errorBody.raw.slice(0, 300).replace(/\s+/g, ' ')}`
+                );
+                markGeminiKeyResult(key, false);
+
+                if (!classified.retryable) break;
+                continue;
+            }
+
+            if (!response.body) {
+                failures.push(`${geminiKeyLabel(geminiKeys, key)}: response.body خالی بود`);
+                markGeminiKeyResult(key, false);
+                continue;
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buffer = '';
+            let lastEmptyReason = null;
+
+            const consumeEvent = (eventText) => {
+                const lines = eventText.split(/\r?\n/);
+                const dataLine = lines.find(line => line.startsWith('data:'));
+                if (!dataLine) return;
+
+                const jsonStr = dataLine.slice(5).trim();
+                if (!jsonStr || jsonStr === '[DONE]') return;
+
+                let parsed;
                 try {
-                    const response = await fetch(
-                        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(currentModel)}:streamGenerateContent?alt=sse`,
-                        {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'x-goog-api-key': currentKey
-                            },
-                            body: JSON.stringify(makeGeminiRequestBody(historyForPrompt)),
-                            signal: controller.signal
-                        }
-                    );
-
-                    if (!response.ok) {
-                        const body = await response.text().catch(() => '');
-                        const err = makeHttpGeminiError(response.status, body);
-                        const classified = classifyGeminiError(err);
-                        failures.push(`${keyLabel(keys, currentKey)} try${attempt}: HTTP ${response.status} ${body.slice(0, 240).replace(/\s+/g, ' ')}`);
-                        lastError = err;
-                        if (classified.keySpecific) markKeyResult(currentKey, false);
-                        if (!classified.retryable) break;
-                    } else {
-                        const processEvent = (rawEvent) => {
-                            const line = rawEvent.split(/\r?\n/).find(l => l.startsWith('data:'));
-                            if (!line) return;
-                            const jsonStr = line.slice(5).trim();
-                            if (!jsonStr || jsonStr === '[DONE]') return;
-                            let parsed;
-                            try { parsed = JSON.parse(jsonStr); } catch (_) { return; }
-                            const cand = parsed?.candidates?.[0];
-                            const pieceText = cand?.content?.parts?.map(p => p?.text || '').join('') || '';
-                            if (pieceText) {
-                                fullText += pieceText;
-                                emittedAny = true;
-                                onChunk(pieceText);
-                            } else if (cand?.finishReason || parsed?.promptFeedback?.blockReason) {
-                                lastEmptyReason = cand?.finishReason || `prompt blocked: ${parsed.promptFeedback.blockReason}`;
-                            }
-                        };
-
-                        for await (const rawChunk of response.body) {
-                            buffer += Buffer.isBuffer(rawChunk) ? rawChunk.toString('utf8') : String(rawChunk);
-                            let sep;
-                            while ((sep = buffer.search(/\r?\n\r?\n/)) !== -1) {
-                                const rawEvent = buffer.slice(0, sep);
-                                const match = buffer.slice(sep).match(/^\r?\n\r?\n/);
-                                buffer = buffer.slice(sep + (match ? match[0].length : 2));
-                                processEvent(rawEvent);
-                            }
-                        }
-                        if (buffer.trim()) processEvent(buffer);
-
-                        if (fullText.trim()) {
-                            markKeyResult(currentKey, true);
-                            return fullText;
-                        }
-
-                        const reason = lastEmptyReason || 'دلیل نامشخص';
-                        failures.push(`${keyLabel(keys, currentKey)} try${attempt}: پاسخ استریم بدون متن (${reason})`);
-                        if (isPermanentEmptyReason(reason)) break;
-                        markKeyResult(currentKey, false);
-                    }
-                } catch (err) {
-                    const classified = classifyGeminiError(err);
-                    failures.push(`${keyLabel(keys, currentKey)} try${attempt}: ${classified.category}${classified.rawMessage ? ` (${classified.rawMessage})` : ''}`);
-                    lastError = err;
-                    if (emittedAny) {
-                        console.error(`[shared-chats] stream interrupted mid-way (model=${currentModel}, ${keyLabel(keys, currentKey)}): ${err?.message || err}`);
-                        throw new Error('پاسخ ربات وسط راه قطع شد.');
-                    }
-                    if (classified.keySpecific) markKeyResult(currentKey, false);
-                    if (!classified.retryable) break;
-                } finally {
-                    clearTimeout(timeoutId);
+                    parsed = JSON.parse(jsonStr);
+                } catch (_) {
+                    return;
                 }
 
-                if (attempt < MAX_ATTEMPTS_PER_KEY && Date.now() < overallDeadline) {
-                    await new Promise(resolve => setTimeout(resolve, BOT_RETRY_DELAY_MS * attempt));
+                const candidate = parsed?.candidates?.[0];
+                const pieceText = extractGeminiText(parsed);
+                if (pieceText) {
+                    fullText += pieceText;
+                    emittedText += pieceText;
+                    emittedThisAttempt = true;
+                    try {
+                        onChunk(pieceText);
+                    } catch (callbackError) {
+                        controller.abort();
+                        throw callbackError;
+                    }
+                    return;
+                }
+
+                lastEmptyReason = candidate?.finishReason ||
+                    (parsed?.promptFeedback?.blockReason
+                        ? `prompt blocked: ${parsed.promptFeedback.blockReason}`
+                        : lastEmptyReason);
+            };
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+
+                let separatorIndex;
+                while ((separatorIndex = buffer.search(/\r?\n\r?\n/)) !== -1) {
+                    const eventText = buffer.slice(0, separatorIndex);
+                    const separator = buffer.match(/\r?\n\r?\n/)[0];
+                    buffer = buffer.slice(separatorIndex + separator.length);
+                    consumeEvent(eventText);
                 }
             }
+
+            buffer += decoder.decode();
+            if (buffer.trim()) consumeEvent(buffer);
+
+            if (fullText.trim()) {
+                markGeminiKeyResult(key, true);
+                return fullText.trim();
+            }
+
+            const permanent = isPermanentNoTextReason(lastEmptyReason);
+            failures.push(
+                `${geminiKeyLabel(geminiKeys, key)}: پاسخ استریم بدون متن ` +
+                `(${String(lastEmptyReason || 'دلیل نامشخص').slice(0, 180)})`
+            );
+            markGeminiKeyResult(key, !permanent ? false : true);
+            if (permanent) break;
+        } catch (err) {
+            const classified = classifyGeminiError(err);
+            failures.push(
+                `${geminiKeyLabel(geminiKeys, key)}: ${
+                    classified.category === 'timeout'
+                        ? 'timeout'
+                        : (err?.message || String(err)).slice(0, 180)
+                }`
+            );
+
+            // مهم: اگر حتی بخشی از متن به کلاینت رسیده، از اول روی کلید بعدی
+            // پاسخ را تکرار نمی‌کنیم؛ همین متن را ذخیره می‌کنیم تا duplicate نشود.
+            if (emittedThisAttempt || emittedText.trim()) {
+                console.error(
+                    `[shared-chats] stream interrupted mid-way (model=${modelName}, ` +
+                    `${geminiKeyLabel(geminiKeys, key)}): ${err?.message || err}`
+                );
+                if (emittedText.trim()) return emittedText.trim();
+                throw new Error('پاسخ ربات وسط راه قطع شد.');
+            }
+
+            markGeminiKeyResult(key, false);
+        } finally {
+            clearTimeout(timeoutId);
         }
     }
 
-    const classified = classifyGeminiError(lastError || new Error('Gemini deadline exceeded'));
     console.error(
-        `[shared-chats] Gemini stream failed (models=${models.join(',')}, ${Date.now() - startedAt}ms, category=${classified.category}): ${failures.join(' | ') || 'no attempts'}`
+        `[shared-chats] Gemini stream failed (model=${modelName}, ${Date.now() - startedAt}ms): ` +
+        `${failures.join(' | ') || 'no attempts'}`
     );
     throw new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
 }
