@@ -248,32 +248,62 @@ const SHARED_CHAT_SYSTEM_TEXT =
     'قانون شماره‌گذاری لیست تودرتو (مهم): هر سطح فقط یک‌بار شماره/بولت بگیرد - هرگز ننویس «۱. بخش ۱» یا زیر آیتم شماره‌ی «۱» دوباره زیرشماره‌ی «۱.۱» را با پیشوند تکراری تکرار نکن؛ ' +
     'برای زیرسطح از حروف (الف، ب) یا خط تیره‌ی ساده استفاده کن، نه تکرار همان عدد پدر. لیست تودرتو با ۲ فاصله برای هر سطح تورفتگی داشته باشد.\n' +
     'ریاضی: درون‌خطی با $...$ و مستقل/بزرگ با $$...$$؛ علامت $ را escape نکن.\n' +
-    'درباره‌ی چیزهایی که نمی‌دانی اطلاعات ساختگی نده و بگو مطمئن نیستی.';
+    'درباره‌ی چیزهایی که نمی‌دانی اطلاعات ساختگی نده و بگو مطمئن نیستی.\n' +
+    'قالب‌بندی پیشرفته (فقط وقتی واقعاً لازم است): ایتالیک با *متن* یا _متن_؛ خط‌خورده با ~~متن~~؛ لینک واقعی با [متن](https://...)؛ جدول فقط برای داده‌ی جدولی.\n' +
+    'برای یک اسم یا مفهوم کوتاه و مهم، نه جمله، می‌توانی از برچسب تزئینی {{entity:نام}} استفاده کنی؛ فقط وقتی واقعاً به خوانایی کمک می‌کند و زیاده‌روی نکن.\n' +
+    'برای اطلاعات به‌روز، قیمت، اخبار، رویدادها یا چیزی که ممکن است بعد از زمان آموزش مدل تغییر کرده باشد، از ابزار web_search استفاده کن. برای سؤال ثابت و عمومی سرچ نکن. قبل از ابزار هیچ مقدمه‌ای برای کاربر نساز. برای هر سؤال معمولاً یک سرچ کافی است و سرچ تکراری فقط وقتی مجاز است که نتیجه‌ی اول واقعاً ناکافی/نامرتبط باشد.\n' +
+    'هنگام پاسخ به گفتگوی مشترک، نتیجه‌ی سرچ را در پاسخ نهایی با زبان طبیعی و دقیق به کار ببر و لینک/منبع واقعی را از نتیجه‌ی ابزار حفظ کن.';
 
 // ===== Gemini engine (Shared Chat) =====
-// این بخش عمداً فقط موتور ارتباط با Gemini را مدیریت می‌کند. تمام قابلیت‌های
-// Shared Chat (احراز هویت، Supabase، دعوت، آپلود، history، lock، send و stream)
-// بیرون از این بلوک دست‌نخورده باقی می‌مانند.
+// این بخش موتور مشترک Gemini + وب‌سرچ را نگه می‌دارد؛ قابلیت‌های مربوط به
+// فایل/ویدیو/Live عمداً وارد Shared Chat نمی‌شوند.
 //
-// تفاوت اصلی با نسخه‌ی قبلی:
-// 1) به‌جای گیر کردن روی یک کلید به مدت 20 ثانیه، هر تلاش deadline مستقل و کوتاه دارد.
-// 2) کلیدها بر اساس health/error count مرتب می‌شوند و خطای یک کلید کل pool را متوقف نمی‌کند.
-// 3) برای خطاهای گذرا (503/429/timeout/network/401/403/404) سریع به کلید بعدی می‌رویم.
-// 4) سقف کل زمان request همچنان زیر timeout کلاینت Shared Chat نگه داشته می‌شود.
-// 5) در stream اگر قبل از قطع اتصال متن واقعی به کلاینت رسیده باشد، پاسخ دوباره از اول
-//    روی کلید دیگری شروع نمی‌شود؛ متن موجود به‌عنوان پاسخ نهایی حفظ می‌شود تا duplicate نشود.
+// هم‌راستاسازی با chat.js:
+// 1) health-aware key rotation و deadline مستقل برای هر کلید.
+// 2) streamGenerateContent با SSE واقعی و ارسال chunk به محض رسیدن.
+// 3) web_search با function calling واقعی Gemini + Tavily.
+// 4) بعد از یک web_search برای همان سؤال، سرچ دوباره انجام نمی‌شود.
+// 5) قطع اتصال/Stop کلاینت با AbortSignal به Gemini و Tavily منتقل می‌شود.
+// 6) اگر استریم وسط راه قطع شود، متن رسیده دوباره از اول تکرار نمی‌شود.
 
 const GEMINI_KEY_FAILURE_COUNTS = new Map();
+const TAVILY_KEY_FAILURE_COUNTS = new Map();
 
-// The original Shared Chat constants stay intact for compatibility, but the
-// effective Gemini attempt cap is deliberately shorter. A single 20s timeout
-// on one key must never consume almost the entire 26s request budget and
-// prevent the remaining keys from being tried.
+// Compatibility constants above remain unchanged; the effective cap below is
+// intentionally short so a single bad key cannot consume the full request budget.
 const SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS = Math.min(
     BOT_PER_CALL_TIMEOUT_MS,
     4500
 );
 const SHARED_GEMINI_MIN_REMAINING_MS = 1200;
+const SHARED_TAVILY_TIMEOUT_MS = 5000;
+const SHARED_SEARCH_PREAMBLE_HOLD_MS = 1500;
+
+const SHARED_GEMINI_TOOLS = [
+    {
+        function_declarations: [
+            {
+                name: 'web_search',
+                description:
+                    'جستجوی واقعی و زنده در وب برای اطلاعات به‌روز، قیمت، اخبار، رویدادها یا هر چیزی که ممکن است بعد از زمان آموزش مدل تغییر کرده باشد یا مدل به آن مطمئن نیست. برای سؤال‌های ثابت و عمومی از این ابزار استفاده نکن. معمولاً یک بار سرچ کافی است؛ تکرار فقط وقتی مجاز است که نتیجه‌ی اول واقعاً ناقص یا نامرتبط باشد.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        query: {
+                            type: 'string',
+                            description: 'عبارت جستجوی کوتاه و دقیق.'
+                        },
+                        reason: {
+                            type: 'string',
+                            description: 'یک دلیل کوتاه فارسی برای سرچ که در صورت نیاز به رابط کاربر نشان داده می‌شود.'
+                        }
+                    },
+                    required: ['query', 'reason']
+                }
+            }
+        ]
+    }
+];
 
 function rotateGeminiKeysByHealth(keys) {
     const shuffled = keys
@@ -288,15 +318,25 @@ function rotateGeminiKeysByHealth(keys) {
     });
 }
 
+function rotateTavilyKeysByHealth(keys) {
+    const shuffled = keys
+        .map(key => ({ key, order: Math.random() }))
+        .sort((a, b) => a.order - b.order)
+        .map(({ key }) => key);
+
+    return shuffled.sort((a, b) => {
+        const fa = TAVILY_KEY_FAILURE_COUNTS.get(a) || 0;
+        const fb = TAVILY_KEY_FAILURE_COUNTS.get(b) || 0;
+        return fa - fb;
+    });
+}
+
 function markGeminiKeyResult(key, ok) {
-    if (ok) {
-        GEMINI_KEY_FAILURE_COUNTS.set(key, 0);
-        return;
-    }
-    GEMINI_KEY_FAILURE_COUNTS.set(
-        key,
-        (GEMINI_KEY_FAILURE_COUNTS.get(key) || 0) + 1
-    );
+    GEMINI_KEY_FAILURE_COUNTS.set(key, ok ? 0 : (GEMINI_KEY_FAILURE_COUNTS.get(key) || 0) + 1);
+}
+
+function markTavilyKeyResult(key, ok) {
+    TAVILY_KEY_FAILURE_COUNTS.set(key, ok ? 0 : (TAVILY_KEY_FAILURE_COUNTS.get(key) || 0) + 1);
 }
 
 function geminiKeyLabel(keys, key) {
@@ -331,136 +371,33 @@ function classifyGeminiError(error) {
     const normalized = `${providerCode || ''} ${rawMessage}`.toLowerCase();
 
     if (error?.name === 'AbortError' || /timeout|timed out|deadline exceeded/.test(normalized)) {
-        return {
-            category: 'timeout',
-            retryable: true,
-            keySpecific: false,
-            status,
-            providerCode,
-            rawMessage
-        };
+        return { category: 'timeout', retryable: true, keySpecific: false, status, providerCode, rawMessage };
     }
-
-    if (
-        status === 429 ||
-        /resource_exhausted|quota|rate.?limit|too many requests/.test(normalized)
-    ) {
-        return {
-            category: 'rate_limit_or_quota',
-            retryable: true,
-            keySpecific: true,
-            status: status || 429,
-            providerCode,
-            rawMessage
-        };
+    if (status === 429 || /resource_exhausted|quota|rate.?limit|too many requests/.test(normalized)) {
+        return { category: 'rate_limit_or_quota', retryable: true, keySpecific: true, status: status || 429, providerCode, rawMessage };
     }
-
-    if (
-        status === 401 ||
-        /api key|invalid.*key|unauthenticated|authentication/.test(normalized)
-    ) {
-        return {
-            category: 'invalid_api_key',
-            retryable: true,
-            keySpecific: true,
-            status: status || 401,
-            providerCode,
-            rawMessage
-        };
+    if (status === 401 || /api key|invalid.*key|unauthenticated|authentication/.test(normalized)) {
+        return { category: 'invalid_api_key', retryable: true, keySpecific: true, status: status || 401, providerCode, rawMessage };
     }
-
-    if (
-        status === 403 ||
-        /permission|forbidden|access denied|not authorized/.test(normalized)
-    ) {
-        return {
-            category: 'permission_denied',
-            retryable: true,
-            keySpecific: true,
-            status: status || 403,
-            providerCode,
-            rawMessage
-        };
+    if (status === 403 || /permission|forbidden|access denied|not authorized/.test(normalized)) {
+        return { category: 'permission_denied', retryable: true, keySpecific: true, status: status || 403, providerCode, rawMessage };
     }
-
-    if (
-        status === 404 ||
-        /model.*not found|not_found|unknown model/.test(normalized)
-    ) {
-        return {
-            category: 'model_not_found',
-            retryable: true,
-            keySpecific: false,
-            status: status || 404,
-            providerCode,
-            rawMessage
-        };
+    if (status === 404 || /model.*not found|not_found|unknown model/.test(normalized)) {
+        return { category: 'model_not_found', retryable: true, keySpecific: false, status: status || 404, providerCode, rawMessage };
     }
-
-    if (
-        status === 400 ||
-        /invalid argument|invalid request|bad request|malformed/.test(normalized)
-    ) {
-        return {
-            category: 'invalid_request',
-            retryable: false,
-            keySpecific: false,
-            status: status || 400,
-            providerCode,
-            rawMessage
-        };
+    if (status === 400 || /invalid argument|invalid request|bad request|malformed/.test(normalized)) {
+        return { category: 'invalid_request', retryable: false, keySpecific: false, status: status || 400, providerCode, rawMessage };
     }
-
-    if (
-        status === 413 ||
-        /too large|payload.*large|request.*size|token limit|context length/.test(normalized)
-    ) {
-        return {
-            category: 'request_too_large',
-            retryable: false,
-            keySpecific: false,
-            status: status || 413,
-            providerCode,
-            rawMessage
-        };
+    if (status === 413 || /too large|payload.*large|request.*size|token limit|context length/.test(normalized)) {
+        return { category: 'request_too_large', retryable: false, keySpecific: false, status: status || 413, providerCode, rawMessage };
     }
-
-    if (
-        (status >= 500 && status <= 599) ||
-        /service unavailable|internal server error|bad gateway|temporarily unavailable/.test(normalized)
-    ) {
-        return {
-            category: 'provider_unavailable',
-            retryable: true,
-            keySpecific: false,
-            status,
-            providerCode,
-            rawMessage
-        };
+    if ((status >= 500 && status <= 599) || /service unavailable|internal server error|bad gateway|temporarily unavailable/.test(normalized)) {
+        return { category: 'provider_unavailable', retryable: true, keySpecific: false, status, providerCode, rawMessage };
     }
-
-    if (
-        error instanceof TypeError ||
-        /fetch failed|network|socket|econn|enotfound|connection/.test(normalized)
-    ) {
-        return {
-            category: 'network_error',
-            retryable: true,
-            keySpecific: false,
-            status,
-            providerCode,
-            rawMessage
-        };
+    if (error instanceof TypeError || /fetch failed|network|socket|econn|enotfound|connection/.test(normalized)) {
+        return { category: 'network_error', retryable: true, keySpecific: false, status, providerCode, rawMessage };
     }
-
-    return {
-        category: 'unknown_error',
-        retryable: true,
-        keySpecific: false,
-        status,
-        providerCode,
-        rawMessage
-    };
+    return { category: 'unknown_error', retryable: true, keySpecific: false, status, providerCode, rawMessage };
 }
 
 async function readGeminiErrorBody(response) {
@@ -481,17 +418,41 @@ function getGeminiKeys() {
     );
 }
 
-function buildGeminiRequestBody(historyForPrompt) {
-    return {
-        system_instruction: { parts: [{ text: SHARED_CHAT_SYSTEM_TEXT }] },
-        contents: historyForPrompt
-    };
+function getTavilyKeys() {
+    return rotateTavilyKeysByHealth(
+        (process.env.TAVILY_API_KEYS || process.env.TAVILY_API_KEY || '')
+            .split(',')
+            .map(k => k.trim())
+            .filter(Boolean)
+    );
+}
+
+function looksLikeWebSearchIntent(text) {
+    const s = String(text || '').toLowerCase();
+    if (!s.trim()) return false;
+    return /(?:سرچ|جستجو|گوگل|وب|اینترنت|قیمت(?:\s|‌)*(?:الان|امروز|فعلی|جدید|لحظه)|الان چنده|قیمتش|هزینه|آخرین|امروز|امشب|اخبار|خبرهای|آب[\u200c ]?وهوا|هوا(?:ی|\s)|نرخ|ارز|دلار|یورو|طلا|سهام|موجودی|current|latest|today|right now|now|search|google|look up|news|weather|price|stock|exchange rate|availability)/i.test(s);
+}
+
+function extractGeminiParts(data) {
+    const parts = data?.candidates?.[0]?.content?.parts;
+    return Array.isArray(parts) ? parts : [];
 }
 
 function extractGeminiText(data) {
-    const parts = data?.candidates?.[0]?.content?.parts;
-    if (!Array.isArray(parts)) return '';
-    return parts.map(p => p?.text || '').join('');
+    return extractGeminiParts(data)
+        .map(p => p?.text || '')
+        .filter(Boolean)
+        .join('');
+}
+
+function extractFunctionCall(data) {
+    const part = extractGeminiParts(data).find(p => p?.functionCall?.name);
+    if (!part?.functionCall) return null;
+    return {
+        name: part.functionCall.name,
+        args: part.functionCall.args || {},
+        thoughtSignature: part.thoughtSignature || null
+    };
 }
 
 function isPermanentNoTextReason(reason) {
@@ -499,100 +460,290 @@ function isPermanentNoTextReason(reason) {
     return ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT'].some(r => value.includes(r));
 }
 
-// ===== پاسخ غیر-استریمی برای کلاینت‌های قدیمی =====
-async function getBotReply(historyForPrompt, model) {
-    const geminiKeys = getGeminiKeys();
-    if (!geminiKeys.length) {
-        throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
+function buildGeminiRequestBody(contents, options = {}) {
+    const includeTools = options.includeTools !== false && !options.searchUsed;
+    return {
+        system_instruction: { parts: [{ text: SHARED_CHAT_SYSTEM_TEXT }] },
+        contents,
+        ...(includeTools ? { tools: SHARED_GEMINI_TOOLS } : {})
+    };
+}
+
+function makeAbortController(externalSignal, timeoutMs) {
+    const controller = new AbortController();
+    const onExternalAbort = () => {
+        try { controller.abort(externalSignal?.reason); } catch (_) { controller.abort(); }
+    };
+    if (externalSignal) {
+        if (externalSignal.aborted) onExternalAbort();
+        else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
     }
+    const timeoutId = setTimeout(() => controller.abort(), Math.max(250, timeoutMs));
+    return {
+        controller,
+        timeoutId,
+        cleanup() {
+            clearTimeout(timeoutId);
+            if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
+        }
+    };
+}
+
+function getSearchResultText(result) {
+    if (!result) return 'جستجوی وب نتیجه‌ای برنگرداند.';
+    if (result.ok) return result.result;
+    return `[جستجوی وب ناموفق بود | ${result.code || 'search_error'}] ${result.message || 'نتیجه‌ای دریافت نشد.'}`;
+}
+
+async function fetchTavilyResults(query, searchCache, externalSignal) {
+    const keys = getTavilyKeys();
+    if (!keys.length) {
+        return {
+            ok: false,
+            code: 'search_not_configured',
+            status: null,
+            retryable: false,
+            message: 'سرویس جستجو پیکربندی نشده است.'
+        };
+    }
+
+    const cacheKey = String(query || '').trim().toLowerCase();
+    if (!cacheKey) {
+        return { ok: false, code: 'search_empty_query', status: 400, retryable: false, message: 'عبارت جستجو خالی بود.' };
+    }
+    if (searchCache?.has(cacheKey)) return searchCache.get(cacheKey);
+
+    const currentKey = keys[0];
+    const keyIndex = keys.indexOf(currentKey) + 1;
+    const fail = (code, message, status = null, retryable = false) => {
+        const result = { ok: false, code, status, retryable, message };
+        if (searchCache) searchCache.set(cacheKey, result);
+        return result;
+    };
+
+    const abort = makeAbortController(externalSignal, SHARED_TAVILY_TIMEOUT_MS);
+    try {
+        const response = await fetch('https://api.tavily.com/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                api_key: currentKey,
+                query: cacheKey,
+                search_depth: 'basic',
+                max_results: 2
+            }),
+            signal: abort.controller.signal
+        });
+
+        if (!response.ok) {
+            let body = null;
+            try { body = await response.json(); } catch (_) {}
+            markTavilyKeyResult(currentKey, false);
+            const status = response.status;
+            if (status === 401 || status === 403) return fail('search_invalid_key', 'کلید سرویس جستجو معتبر نیست یا دسترسی آن رد شده است.', status, false);
+            if (status === 429) return fail('search_rate_limit', 'سرویس جستجو به محدودیت درخواست رسید.', status, true);
+            if (status >= 500) return fail('search_provider_error', 'خود سرویس جستجو موقتاً با خطای سرور مواجه شد.', status, true);
+            return fail('search_http_error', `سرویس جستجو درخواست را رد کرد (${status}).`, status, false);
+        }
+
+        const data = await response.json();
+        if (!Array.isArray(data?.results) || data.results.length === 0) {
+            markTavilyKeyResult(currentKey, true);
+            return fail('search_no_results', 'جستجو انجام شد اما نتیجه‌ای برای این عبارت پیدا نشد.', 200, false);
+        }
+
+        markTavilyKeyResult(currentKey, true);
+        const formatted = data.results.map(r =>
+            `عنوان: ${r.title || 'بدون عنوان'}\n` +
+            `منبع: ${r.url || 'نامشخص'}\n` +
+            `محتوا: ${String(r.content || '').slice(0, 1800)}`
+        ).join('\n\n---\n\n');
+
+        const success = { ok: true, code: 'search_success', status: 200, result: formatted };
+        if (searchCache) searchCache.set(cacheKey, success);
+        return success;
+    } catch (err) {
+        markTavilyKeyResult(currentKey, false);
+        if (externalSignal?.aborted) throw err;
+        if (err?.name === 'AbortError') return fail('search_timeout', 'جستجوی وب در زمان تعیین‌شده پاسخ نداد.', 408, true);
+        return fail('search_network_error', 'ارتباط با سرویس جستجو برقرار نشد.', null, true);
+    } finally {
+        abort.cleanup();
+    }
+}
+
+async function runGeminiJsonRequest(contents, modelName, key, externalSignal, timeoutMs, includeTools = true) {
+    const abort = makeAbortController(externalSignal, timeoutMs);
+    try {
+        return await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent`,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': key
+                },
+                body: JSON.stringify(buildGeminiRequestBody(contents, { includeTools })),
+                signal: abort.controller.signal
+            }
+        );
+    } finally {
+        abort.cleanup();
+    }
+}
+
+async function getBotReply(historyForPrompt, model, externalSignal) {
+    const geminiKeys = getGeminiKeys();
+    if (!geminiKeys.length) throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
 
     const startedAt = Date.now();
     const failures = [];
     const modelName = model || DEFAULT_MODEL;
+    const searchCache = new Map();
+    const searchState = { used: false, result: null };
+    let workingContents = [...historyForPrompt];
 
     for (let keyIdx = 0; keyIdx < geminiKeys.length; keyIdx++) {
+        if (externalSignal?.aborted) throw new Error('client_disconnected');
         const key = geminiKeys[keyIdx];
-        const remainingBeforeAttempt = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
-        if (remainingBeforeAttempt < SHARED_GEMINI_MIN_REMAINING_MS) break;
-
-        const attemptTimeoutMs = Math.min(
-            SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS,
-            Math.max(1000, remainingBeforeAttempt - 250)
-        );
-
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
+        let remaining = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
+        if (remaining < SHARED_GEMINI_MIN_REMAINING_MS) break;
+        const timeoutMs = Math.min(SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS, Math.max(1000, remaining - 250));
 
         try {
-            const response = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent`,
-                {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-goog-api-key': key
-                    },
-                    body: JSON.stringify(buildGeminiRequestBody(historyForPrompt)),
-                    signal: controller.signal
-                }
+            const firstResponse = await runGeminiJsonRequest(
+                workingContents,
+                modelName,
+                key,
+                externalSignal,
+                timeoutMs,
+                !searchState.used
             );
 
-            if (!response.ok) {
-                const errorBody = await readGeminiErrorBody(response);
+            if (!firstResponse.ok) {
+                const errorBody = await readGeminiErrorBody(firstResponse);
                 const classified = classifyGeminiError({
-                    status: response.status,
-                    statusText: response.statusText,
+                    status: firstResponse.status,
+                    statusText: firstResponse.statusText,
                     body: errorBody.parsed,
                     message: errorBody.parsed?.error?.message || errorBody.raw
                 });
-
-                failures.push(
-                    `${geminiKeyLabel(geminiKeys, key)}: HTTP ${response.status} ` +
-                    `${errorBody.raw.slice(0, 300).replace(/\s+/g, ' ')}`
-                );
+                failures.push(`${geminiKeyLabel(geminiKeys, key)}: HTTP ${firstResponse.status} ${errorBody.raw.slice(0, 280).replace(/\s+/g, ' ')}`);
                 markGeminiKeyResult(key, false);
-
                 if (!classified.retryable) break;
                 continue;
             }
 
-            const data = await response.json();
-            const text = extractGeminiText(data).trim();
+            const firstData = await firstResponse.json();
+            const functionCall = extractFunctionCall(firstData);
+            const firstText = extractGeminiText(firstData).trim();
 
-            if (text) {
-                markGeminiKeyResult(key, true);
-                return text;
+            if (functionCall?.name === 'web_search' && !searchState.used) {
+                searchState.used = true;
+                const query = String(functionCall.args?.query || '').trim();
+                const searchResult = await fetchTavilyResults(query, searchCache, externalSignal);
+                searchState.result = searchResult;
+
+                remaining = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
+                if (remaining < SHARED_GEMINI_MIN_REMAINING_MS) {
+                    if (searchResult?.result) {
+                        workingContents = [
+                            ...historyForPrompt,
+                            { role: 'user', parts: [{ text: `[نتیجه جستجوی وب برای سؤال فعلی]\n${getSearchResultText(searchResult)}` }] }
+                        ];
+                    }
+                    break;
+                }
+
+                const followupTimeout = Math.min(SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS, Math.max(1000, remaining - 250));
+                const followupContents = [
+                    ...historyForPrompt,
+                    {
+                        role: 'model',
+                        parts: [{
+                            functionCall: functionCall.args
+                                ? { name: functionCall.name, args: functionCall.args }
+                                : { name: functionCall.name, args: {} },
+                            ...(functionCall.thoughtSignature ? { thoughtSignature: functionCall.thoughtSignature } : {})
+                        }]
+                    },
+                    {
+                        role: 'user',
+                        parts: [{
+                            functionResponse: {
+                                name: 'web_search',
+                                response: {
+                                    result: getSearchResultText(searchResult),
+                                    searchError: searchResult?.ok ? null : {
+                                        code: searchResult?.code || 'search_error',
+                                        status: searchResult?.status ?? null
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                ];
+
+                const secondResponse = await runGeminiJsonRequest(
+                    followupContents,
+                    modelName,
+                    key,
+                    externalSignal,
+                    followupTimeout,
+                    false
+                );
+
+                if (!secondResponse.ok) {
+                    const errorBody = await readGeminiErrorBody(secondResponse);
+                    const classified = classifyGeminiError({ status: secondResponse.status, statusText: secondResponse.statusText, body: errorBody.parsed, message: errorBody.parsed?.error?.message || errorBody.raw });
+                    failures.push(`${geminiKeyLabel(geminiKeys, key)}: follow-up HTTP ${secondResponse.status} ${errorBody.raw.slice(0, 260).replace(/\s+/g, ' ')}`);
+                    markGeminiKeyResult(key, false);
+                    if (classified.retryable && searchResult?.result) {
+                        // Never search again. Let the next key answer using the saved web result as ordinary context.
+                        workingContents = [
+                            ...historyForPrompt,
+                            { role: 'user', parts: [{ text: `[نتیجه جستجوی وب که همین سؤال قبلاً دریافت کرده است]\n${getSearchResultText(searchResult)}\n\nبا استفاده از همین نتیجه، پاسخ نهایی را بده.` }] }
+                        ];
+                        continue;
+                    }
+                    if (!classified.retryable) break;
+                    continue;
+                }
+
+                const secondData = await secondResponse.json();
+                const text = extractGeminiText(secondData).trim();
+                if (text) {
+                    markGeminiKeyResult(key, true);
+                    return text;
+                }
+                const why = secondData?.candidates?.[0]?.finishReason || secondData?.promptFeedback?.blockReason || 'no candidates';
+                failures.push(`${geminiKeyLabel(geminiKeys, key)}: follow-up بدون متن (${String(why).slice(0, 160)})`);
+                if (isPermanentNoTextReason(why)) break;
+                markGeminiKeyResult(key, false);
+                continue;
             }
 
-            const candidate = data?.candidates?.[0];
-            const why = candidate?.finishReason ||
-                (data?.promptFeedback?.blockReason
-                    ? `prompt blocked: ${data.promptFeedback.blockReason}`
-                    : 'no candidates');
-
-            failures.push(
-                `${geminiKeyLabel(geminiKeys, key)}: پاسخ بدون متن (${String(why).slice(0, 180)})`
-            );
-
-            // پاسخ 200 اما بدون متن معمولاً با همان ورودی تکرارپذیر است؛
-            // مگر این‌که دلیل ناشناخته باشد که ممکن است گذرا بوده باشد.
-            if (isPermanentNoTextReason(why)) {
+            if (firstText) {
                 markGeminiKeyResult(key, true);
-                break;
+                return firstText;
             }
-            markGeminiKeyResult(key, false);
+
+            const why = firstData?.candidates?.[0]?.finishReason || firstData?.promptFeedback?.blockReason || 'no candidates';
+            failures.push(`${geminiKeyLabel(geminiKeys, key)}: پاسخ بدون متن (${String(why).slice(0, 180)})`);
+            markGeminiKeyResult(key, !isPermanentNoTextReason(why));
+            if (isPermanentNoTextReason(why)) break;
         } catch (err) {
+            if (externalSignal?.aborted) throw err;
             const classified = classifyGeminiError(err);
-            failures.push(
-                `${geminiKeyLabel(geminiKeys, key)}: ${
-                    classified.category === 'timeout'
-                        ? 'timeout'
-                        : (err?.message || String(err)).slice(0, 180)
-                }`
-            );
+            failures.push(`${geminiKeyLabel(geminiKeys, key)}: ${classified.category === 'timeout' ? 'timeout' : String(err?.message || err).slice(0, 180)}`);
             markGeminiKeyResult(key, false);
-        } finally {
-            clearTimeout(timeoutId);
+            // If a search already happened, the next key must use its result and may not call web_search again.
+            if (searchState.used && searchState.result?.result) {
+                workingContents = [
+                    ...historyForPrompt,
+                    { role: 'user', parts: [{ text: `[نتیجه جستجوی وب قبلی برای همین سؤال]\n${getSearchResultText(searchState.result)}\n\nبا همین نتیجه پاسخ نهایی را بده و دوباره سرچ نکن.` }] }
+                ];
+            }
         }
     }
 
@@ -603,166 +754,279 @@ async function getBotReply(historyForPrompt, model) {
     throw new Error('پاسخ از سرویس هوش مصنوعی دریافت نشد.');
 }
 
-// ===== پاسخ استریمی =====
-async function streamBotReply(historyForPrompt, model, onChunk) {
-    const geminiKeys = getGeminiKeys();
-    if (!geminiKeys.length) {
-        throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
+async function streamOneGeminiRound({ contents, modelName, key, externalSignal, timeoutMs, includeTools, onText, searchIntent }) {
+    const abort = makeAbortController(externalSignal, timeoutMs);
+    try {
+        const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:streamGenerateContent?alt=sse`,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': key
+                },
+                body: JSON.stringify(buildGeminiRequestBody(contents, { includeTools })),
+                signal: abort.controller.signal
+            }
+        );
+
+        if (!response.ok) {
+            const errorBody = await readGeminiErrorBody(response);
+            const err = new Error('gemini_upstream_failed');
+            err.status = response.status;
+            err.statusText = response.statusText;
+            err.body = errorBody.parsed;
+            err.rawBody = errorBody.raw;
+            throw err;
+        }
+        if (!response.body) throw new Error('Gemini response.body خالی بود');
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+        let accumulatedParts = [];
+        let finishReason = null;
+        let pendingPreamble = '';
+        let preambleTimer = null;
+        let preambleFlushed = false;
+        let functionCall = null;
+        let streamDone = false;
+
+        const emitText = (piece) => {
+            if (!piece) return;
+            try { onText(piece); } catch (e) { throw e; }
+        };
+
+        const flushPending = () => {
+            if (!pendingPreamble) return;
+            emitText(pendingPreamble);
+            pendingPreamble = '';
+            preambleFlushed = true;
+        };
+
+        if (searchIntent && includeTools) {
+            preambleTimer = setTimeout(() => {
+                preambleFlushed = true;
+                flushPending();
+            }, SHARED_SEARCH_PREAMBLE_HOLD_MS);
+        }
+
+        const handleEvent = (eventText) => {
+            const lines = eventText.split(/\r?\n/);
+            const dataLine = lines.find(line => line.startsWith('data:'));
+            if (!dataLine) return;
+            const jsonStr = dataLine.slice(5).trim();
+            if (!jsonStr || jsonStr === '[DONE]') return;
+
+            let parsed;
+            try { parsed = JSON.parse(jsonStr); } catch (_) { return; }
+            const candidate = parsed?.candidates?.[0];
+            if (!candidate) return;
+            if (candidate.finishReason) finishReason = candidate.finishReason;
+
+            const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+            const eventHasFunctionCall = parts.some(part => !!part?.functionCall);
+
+            for (const part of parts) {
+                if (typeof part?.text === 'string') {
+                    const textPart = { text: part.text };
+                    if (part.thoughtSignature) textPart.thoughtSignature = part.thoughtSignature;
+                    accumulatedParts.push(textPart);
+                    if (eventHasFunctionCall) {
+                        // Tool preamble: retain but do not show; if a prior timer already flushed it, it remains visible.
+                        if (!preambleFlushed) pendingPreamble += part.text;
+                    } else if (searchIntent && includeTools && !preambleFlushed && !functionCall) {
+                        pendingPreamble += part.text;
+                    } else {
+                        emitText(part.text);
+                    }
+                } else if (part?.functionCall?.name) {
+                    const fc = {
+                        name: part.functionCall.name,
+                        args: part.functionCall.args || {},
+                        thoughtSignature: part.thoughtSignature || null
+                    };
+                    accumulatedParts.push({
+                        functionCall: { name: fc.name, args: fc.args },
+                        ...(fc.thoughtSignature ? { thoughtSignature: fc.thoughtSignature } : {})
+                    });
+                    if (!functionCall) functionCall = fc;
+                    if (preambleTimer) {
+                        clearTimeout(preambleTimer);
+                        preambleTimer = null;
+                    }
+                    pendingPreamble = '';
+                }
+            }
+        };
+
+        while (!streamDone) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let match;
+            while ((match = buffer.search(/\r?\n\r?\n/)) !== -1) {
+                const separator = buffer.match(/\r?\n\r?\n/)[0];
+                const eventText = buffer.slice(0, match);
+                buffer = buffer.slice(match + separator.length);
+                handleEvent(eventText);
+            }
+        }
+
+        buffer += decoder.decode();
+        if (buffer.trim()) handleEvent(buffer);
+
+        if (preambleTimer) clearTimeout(preambleTimer);
+        if (!functionCall && pendingPreamble) flushPending();
+        return {
+            text: accumulatedParts.filter(p => typeof p.text === 'string').map(p => p.text).join(''),
+            functionCall,
+            finishReason
+        };
+    } finally {
+        abort.cleanup();
     }
+}
+
+async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, onStep) {
+    const geminiKeys = getGeminiKeys();
+    if (!geminiKeys.length) throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
 
     const startedAt = Date.now();
     const failures = [];
     const modelName = model || DEFAULT_MODEL;
-    let emittedText = '';
+    const searchCache = new Map();
+    const searchState = { used: false, result: null };
+    const searchIntent = looksLikeWebSearchIntent(historyForPrompt.map(x => (x?.parts || []).map(p => p?.text || '').join(' ')).join(' '));
+    let accumulatedAnswer = '';
+    let workingContents = [...historyForPrompt];
 
     for (let keyIdx = 0; keyIdx < geminiKeys.length; keyIdx++) {
+        if (externalSignal?.aborted) return accumulatedAnswer.trim();
         const key = geminiKeys[keyIdx];
         const remainingBeforeAttempt = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
         if (remainingBeforeAttempt < SHARED_GEMINI_MIN_REMAINING_MS) break;
-
-        const attemptTimeoutMs = Math.min(
-            SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS,
-            Math.max(1000, remainingBeforeAttempt - 250)
-        );
-
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
-        let fullText = '';
-        let emittedThisAttempt = false;
+        const timeoutMs = Math.min(SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS, Math.max(1000, remainingBeforeAttempt - 250));
 
         try {
-            const response = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:streamGenerateContent?alt=sse`,
-                {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-goog-api-key': key
-                    },
-                    body: JSON.stringify(buildGeminiRequestBody(historyForPrompt)),
-                    signal: controller.signal
-                }
-            );
+            const round = await streamOneGeminiRound({
+                contents: workingContents,
+                modelName,
+                key,
+                externalSignal,
+                timeoutMs,
+                includeTools: !searchState.used,
+                onText: piece => {
+                    accumulatedAnswer += piece;
+                    try { onChunk(piece); } catch (_) {}
+                },
+                searchIntent
+            });
 
-            if (!response.ok) {
-                const errorBody = await readGeminiErrorBody(response);
-                const classified = classifyGeminiError({
-                    status: response.status,
-                    statusText: response.statusText,
-                    body: errorBody.parsed,
-                    message: errorBody.parsed?.error?.message || errorBody.raw
+            if (round.functionCall?.name === 'web_search' && !searchState.used) {
+                searchState.used = true;
+                const query = String(round.functionCall.args?.query || '').trim();
+                const reason = String(round.functionCall.args?.reason || '').trim();
+                if (onStep) {
+                    try { onStep(reason || `دارم درباره‌ی «${query}» توی وب سرچ می‌کنم...`, 'web_search'); } catch (_) {}
+                }
+                const searchResult = await fetchTavilyResults(query, searchCache, externalSignal);
+                searchState.result = searchResult;
+
+                const remainingAfterSearch = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
+                if (remainingAfterSearch < SHARED_GEMINI_MIN_REMAINING_MS) {
+                    return accumulatedAnswer.trim();
+                }
+
+                // The original tool call is valid Gemini context for the immediate follow-up.
+                const followupContents = [
+                    ...historyForPrompt,
+                    {
+                        role: 'model',
+                        parts: [{
+                            functionCall: { name: 'web_search', args: round.functionCall.args || {} },
+                            ...(round.functionCall.thoughtSignature ? { thoughtSignature: round.functionCall.thoughtSignature } : {})
+                        }]
+                    },
+                    {
+                        role: 'user',
+                        parts: [{
+                            functionResponse: {
+                                name: 'web_search',
+                                response: {
+                                    result: getSearchResultText(searchResult),
+                                    searchError: searchResult?.ok ? null : {
+                                        code: searchResult?.code || 'search_error',
+                                        status: searchResult?.status ?? null
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                ];
+
+                const secondTimeout = Math.min(
+                    SHARED_GEMINI_EFFECTIVE_ATTEMPT_TIMEOUT_MS,
+                    Math.max(1000, remainingAfterSearch - 250)
+                );
+                const secondRound = await streamOneGeminiRound({
+                    contents: followupContents,
+                    modelName,
+                    key,
+                    externalSignal,
+                    timeoutMs: secondTimeout,
+                    includeTools: false,
+                    onText: piece => {
+                        accumulatedAnswer += piece;
+                        try { onChunk(piece); } catch (_) {}
+                    },
+                    searchIntent: false
                 });
 
-                failures.push(
-                    `${geminiKeyLabel(geminiKeys, key)}: HTTP ${response.status} ` +
-                    `${errorBody.raw.slice(0, 300).replace(/\s+/g, ' ')}`
-                );
-                markGeminiKeyResult(key, false);
+                if (secondRound.text.trim()) {
+                    markGeminiKeyResult(key, true);
+                    return accumulatedAnswer.trim();
+                }
 
-                if (!classified.retryable) break;
+                const why = secondRound.finishReason || 'follow-up بدون متن';
+                failures.push(`${geminiKeyLabel(geminiKeys, key)}: follow-up بدون متن (${String(why).slice(0, 160)})`);
+                if (isPermanentNoTextReason(why)) break;
+                markGeminiKeyResult(key, false);
+                // Keep search result for next key, but don't call web_search again.
+                workingContents = [
+                    ...historyForPrompt,
+                    { role: 'user', parts: [{ text: `[نتیجه جستجوی وب قبلی برای همین سؤال]\n${getSearchResultText(searchResult)}\n\nبا همین نتیجه پاسخ نهایی را بده و دوباره سرچ نکن.` }] }
+                ];
                 continue;
             }
 
-            if (!response.body) {
-                failures.push(`${geminiKeyLabel(geminiKeys, key)}: response.body خالی بود`);
-                markGeminiKeyResult(key, false);
-                continue;
-            }
-
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder('utf-8');
-            let buffer = '';
-            let lastEmptyReason = null;
-
-            const consumeEvent = (eventText) => {
-                const lines = eventText.split(/\r?\n/);
-                const dataLine = lines.find(line => line.startsWith('data:'));
-                if (!dataLine) return;
-
-                const jsonStr = dataLine.slice(5).trim();
-                if (!jsonStr || jsonStr === '[DONE]') return;
-
-                let parsed;
-                try {
-                    parsed = JSON.parse(jsonStr);
-                } catch (_) {
-                    return;
-                }
-
-                const candidate = parsed?.candidates?.[0];
-                const pieceText = extractGeminiText(parsed);
-                if (pieceText) {
-                    fullText += pieceText;
-                    emittedText += pieceText;
-                    emittedThisAttempt = true;
-                    try {
-                        onChunk(pieceText);
-                    } catch (callbackError) {
-                        controller.abort();
-                        throw callbackError;
-                    }
-                    return;
-                }
-
-                lastEmptyReason = candidate?.finishReason ||
-                    (parsed?.promptFeedback?.blockReason
-                        ? `prompt blocked: ${parsed.promptFeedback.blockReason}`
-                        : lastEmptyReason);
-            };
-
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                buffer += decoder.decode(value, { stream: true });
-
-                let separatorIndex;
-                while ((separatorIndex = buffer.search(/\r?\n\r?\n/)) !== -1) {
-                    const eventText = buffer.slice(0, separatorIndex);
-                    const separator = buffer.match(/\r?\n\r?\n/)[0];
-                    buffer = buffer.slice(separatorIndex + separator.length);
-                    consumeEvent(eventText);
-                }
-            }
-
-            buffer += decoder.decode();
-            if (buffer.trim()) consumeEvent(buffer);
-
-            if (fullText.trim()) {
+            if (round.text.trim()) {
                 markGeminiKeyResult(key, true);
-                return fullText.trim();
+                return accumulatedAnswer.trim();
             }
 
-            const permanent = isPermanentNoTextReason(lastEmptyReason);
-            failures.push(
-                `${geminiKeyLabel(geminiKeys, key)}: پاسخ استریم بدون متن ` +
-                `(${String(lastEmptyReason || 'دلیل نامشخص').slice(0, 180)})`
-            );
-            markGeminiKeyResult(key, !permanent ? false : true);
-            if (permanent) break;
+            const why = round.finishReason || 'no candidates';
+            failures.push(`${geminiKeyLabel(geminiKeys, key)}: پاسخ استریم بدون متن (${String(why).slice(0, 160)})`);
+            markGeminiKeyResult(key, !isPermanentNoTextReason(why));
+            if (isPermanentNoTextReason(why)) break;
         } catch (err) {
+            if (externalSignal?.aborted) return accumulatedAnswer.trim();
             const classified = classifyGeminiError(err);
-            failures.push(
-                `${geminiKeyLabel(geminiKeys, key)}: ${
-                    classified.category === 'timeout'
-                        ? 'timeout'
-                        : (err?.message || String(err)).slice(0, 180)
-                }`
-            );
+            failures.push(`${geminiKeyLabel(geminiKeys, key)}: ${classified.category === 'timeout' ? 'timeout' : String(err?.message || err).slice(0, 180)}`);
 
-            // مهم: اگر حتی بخشی از متن به کلاینت رسیده، از اول روی کلید بعدی
-            // پاسخ را تکرار نمی‌کنیم؛ همین متن را ذخیره می‌کنیم تا duplicate نشود.
-            if (emittedThisAttempt || emittedText.trim()) {
-                console.error(
-                    `[shared-chats] stream interrupted mid-way (model=${modelName}, ` +
-                    `${geminiKeyLabel(geminiKeys, key)}): ${err?.message || err}`
-                );
-                if (emittedText.trim()) return emittedText.trim();
-                throw new Error('پاسخ ربات وسط راه قطع شد.');
+            // Never duplicate already-visible streamed text on a different key.
+            if (accumulatedAnswer.trim()) {
+                console.error(`[shared-chats] stream interrupted mid-way (model=${modelName}, ${geminiKeyLabel(geminiKeys, key)}): ${err?.message || err}`);
+                return accumulatedAnswer.trim();
             }
 
             markGeminiKeyResult(key, false);
-        } finally {
-            clearTimeout(timeoutId);
+            if (searchState.used && searchState.result?.result) {
+                workingContents = [
+                    ...historyForPrompt,
+                    { role: 'user', parts: [{ text: `[نتیجه جستجوی وب قبلی برای همین سؤال]\n${getSearchResultText(searchState.result)}\n\nبا همین نتیجه پاسخ نهایی را بده و دوباره سرچ نکن.` }] }
+                ];
+            }
         }
     }
 
@@ -1273,9 +1537,27 @@ module.exports = async function handler(req, res) {
             });
             if (typeof res.flushHeaders === 'function') res.flushHeaders();
             const sendEvent = (obj) => {
-                res.write(`data: ${JSON.stringify(obj)}\n\n`);
-                if (typeof res.flush === 'function') res.flush();
+                if (res.writableEnded || res.destroyed) return;
+                try {
+                    res.write(`data: ${JSON.stringify(obj)}\n\n`);
+                    if (typeof res.flush === 'function') res.flush();
+                } catch (_) {}
             };
+
+            // Stop/cancel propagation: when the Shared Chat client aborts its
+            // fetch (e.g. the Android-style red ■ Stop button), abort the same
+            // request signal used by Gemini/Tavily so upstream generation really
+            // stops instead of continuing invisibly for the rest of the budget.
+            const clientAbortController = new AbortController();
+            let responseFinished = false;
+            const abortForDisconnect = () => {
+                if (!responseFinished) {
+                    try { clientAbortController.abort(new Error('client_disconnected')); } catch (_) { clientAbortController.abort(); }
+                }
+            };
+            req.once('aborted', abortForDisconnect);
+            res.once('close', abortForDisconnect);
+            res.once('finish', () => { responseFinished = true; });
             // اولین event: پیام کاربر (با id واقعی سرور) - کلاینت این را
             // فوری جایگزین نسخه‌ی optimistic خودش می‌کند، دقیقاً مثل چیزی
             // که قبلاً از فیلد "message" در پاسخ غیر-استریمی می‌خواند.
@@ -1323,21 +1605,38 @@ module.exports = async function handler(req, res) {
                 }
 
                 const chatModel = await getChatModel(chatId);
-                const botText = await streamBotReply(historyForPrompt, chatModel, (piece) => {
-                    sendEvent({ text: piece });
-                });
-                const botMsg = await insertMessage(chatId, 'model', null, botText);
+                const botText = await streamBotReply(
+                    historyForPrompt,
+                    chatModel,
+                    (piece) => { sendEvent({ text: piece }); },
+                    clientAbortController.signal,
+                    (label, toolName) => sendEvent({ status: 'tool', tool: toolName, text: label })
+                );
+                const interruptedByClient = clientAbortController.signal.aborted;
+                const savedBotText = interruptedByClient
+                    ? (botText ? `${botText}\n\n⏹ پاسخ متوقف شد` : '')
+                    : botText;
+                const botMsg = savedBotText
+                    ? await insertMessage(chatId, 'model', null, savedBotText)
+                    : null;
                 await supaFetch(`shared_chats?chat_id=eq.${encodeURIComponent(chatId)}`, {
                     method: 'PATCH',
                     body: JSON.stringify({ updated_at: Date.now() })
                 });
                 if (botMsg) botMsg.attachments = [];
-                sendEvent({ done: true, botMessage: botMsg });
-                return res.end();
+                if (!clientAbortController.signal.aborted) {
+                    sendEvent({ done: true, botMessage: botMsg });
+                    return res.end();
+                }
+                try { res.end(); } catch (_) {}
+                return;
             } catch (err) {
-                console.error('[shared-chats] stream bot reply failed:', err?.message || err);
-                sendEvent({ error: 'پاسخ ربات دریافت نشد.' });
-                return res.end();
+                if (!clientAbortController.signal.aborted) {
+                    console.error('[shared-chats] stream bot reply failed:', err?.message || err);
+                    sendEvent({ error: 'پاسخ ربات دریافت نشد.' });
+                }
+                try { res.end(); } catch (_) {}
+                return;
             } finally {
                 await releaseLock(chatId);
             }
