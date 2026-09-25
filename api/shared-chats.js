@@ -888,6 +888,21 @@ async function streamOneGeminiRound({ contents, modelName, key, externalSignal, 
         let preambleFlushed = false;
         let functionCall = null;
         let streamDone = false;
+        // FIX (پیام دوتایی/تکراری فقط وقتی مدل سرچ وب انجام می‌داد): قبلاً
+        // وقتی preambleTimer زودتر از رسیدن functionCall فایر می‌شد،
+        // preambleFlushed برای همیشه true می‌ماند و دیگر هیچ‌کجا reset
+        // نمی‌شد. یعنی متنی که تا آن لحظه به‌عنوان «پیش‌درآمد» نمایش داده
+        // شده بود (flushPending) هیچ‌وقت discard نمی‌شد، و round دومِ بعد
+        // از نتیجه‌ی سرچ کاملاً از نو یک پاسخ کامل تولید می‌کرد - چون مدل
+        // خبر نداشت بخشی از متن قبلاً به کاربر نشان داده شده. نتیجه: کاربر
+        // یک تکه متن را دوبار (یک‌بار به‌عنوان «پیش‌درآمد» و یک‌بار داخل
+        // پاسخ نهاییِ بعد از سرچ) می‌دید. الگوی درست، دقیقاً مثل چت عادی
+        // (pages/api/chat.js): «تایم‌اوت» فقط یک سقف زمانی برای زنده‌کردن
+        // استریم است، نه یک قفل دائمی روی این‌که آیا هنوز می‌شود preamble
+        // نگه داشت. با رسیدن functionCall واقعی، preambleFlushed هم باید
+        // false شود تا اگر (در همان round) باز هم متن معمولی بیاید، دوباره
+        // به‌درستی به‌عنوان preamble نگه داشته شود، نه این‌که بی‌قید emit شود.
+        let sawFunctionCall = false;
 
         const emitText = (piece) => {
             if (!piece) return;
@@ -924,15 +939,37 @@ async function streamOneGeminiRound({ contents, modelName, key, externalSignal, 
             const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
             const eventHasFunctionCall = parts.some(part => !!part?.functionCall);
 
+            // FIX: به‌محض دیدن اولین functionCall واقعی در این event، تایمر
+            // preamble را کاملاً خنثی کن - هم قطعش کن (مثل قبل) هم هرچه تا
+            // این لحظه به‌عنوان «پیش‌درآمد» به کاربر emit شده را از حساب خارج
+            // کن، دقیقاً هم‌الگو با clearPreambleHoldTimer + پاک‌کردن
+            // pendingToolPreamble در چت عادی. sawFunctionCall از این به بعد
+            // تضمین می‌کند حتی اگر preambleFlushed زودتر true شده باشد، هیچ
+            // متن جدیدی دوباره به‌صورت preamble نگه داشته نشود (زنده streaming
+            // از همین لحظه ادامه می‌یابد) - نه این‌که برای همیشه در حالت
+            // «قبلاً flush شده» گیر بماند و باعث تکرار محتوا در round بعدی شود.
+            if (eventHasFunctionCall && !sawFunctionCall) {
+                sawFunctionCall = true;
+                if (preambleTimer) {
+                    clearTimeout(preambleTimer);
+                    preambleTimer = null;
+                }
+                pendingPreamble = '';
+            }
+
             for (const part of parts) {
                 if (typeof part?.text === 'string') {
                     const textPart = { text: part.text };
                     if (part.thoughtSignature) textPart.thoughtSignature = part.thoughtSignature;
                     accumulatedParts.push(textPart);
                     if (eventHasFunctionCall) {
-                        // Tool preamble: retain but do not show; if a prior timer already flushed it, it remains visible.
-                        if (!preambleFlushed) pendingPreamble += part.text;
-                    } else if (searchIntent && includeTools && !preambleFlushed && !functionCall) {
+                        // Tool preamble در همین رویداد: هرگز نمایش داده نشود
+                        // (چه preambleFlushed قبلاً true شده باشد چه نه).
+                        // متن هنوز به accumulatedParts اضافه شده (بالا) تا
+                        // در تاریخچه/parts موجود بماند، ولی به کاربر نشان
+                        // داده نمی‌شود چون مقدمه‌ی یک تصمیم ابزار است، نه
+                        // بخشی از پاسخ نهایی.
+                    } else if (searchIntent && includeTools && !functionCall && !sawFunctionCall && !preambleFlushed) {
                         pendingPreamble += part.text;
                     } else {
                         emitText(part.text);
@@ -948,11 +985,6 @@ async function streamOneGeminiRound({ contents, modelName, key, externalSignal, 
                         ...(fc.thoughtSignature ? { thoughtSignature: fc.thoughtSignature } : {})
                     });
                     if (!functionCall) functionCall = fc;
-                    if (preambleTimer) {
-                        clearTimeout(preambleTimer);
-                        preambleTimer = null;
-                    }
-                    pendingPreamble = '';
                 }
             }
         };
