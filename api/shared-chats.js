@@ -324,8 +324,9 @@ const SHARED_STREAM_FIRST_BYTE_TIMEOUT_MS = 12 * 1000;
 const SHARED_STREAM_IDLE_MS = 30 * 1000;
 const SHARED_MAX_STREAM_RECOVERIES = 2;
 const SHARED_CONTINUE_PROMPT =
-    '[ادامهٔ پاسخ پس از قطع ناقص استریم — داخلی] پاسخ قبلی در میانهٔ تولید متوقف شد. ' +
-    'دقیقاً از همان نقطه‌ای که متن قبلی تمام شده ادامه بده؛ هیچ بخشی از متن قبلی را تکرار نکن و مقدمه، عذرخواهی یا اشاره به قطع شدن ننویس.';
+    '[ادامهٔ پاسخ پس از قطع ناقص استریم — داخلی] پاسخ قبلی در میانهٔ تولید متوقف شد؛ متنی که تا الان فرستاده شده ممکن است دقیقاً وسط یک کلمه (حتی وسط یک پسوند/ضمیر چسبیده مثل «ت»، «م»، «ش»، «ای»، «ها») بریده شده باشد. ' +
+    'اگر آخرین کاراکترِ متن قبلی حرف است نه فاصله یا علامت نگارشی، بدون هیچ فاصله‌ی اضافه دقیقاً بچسب به همان آخرین حرف و کلمه را کامل کن؛ فقط اگر متن قبلی درست سر یک فاصله یا پایان جمله تمام شده، نوبت تازه را با فاصله/کلمه‌ی بعدی شروع کن. ' +
+    'هیچ بخشی از متن قبلی را تکرار نکن و مقدمه، عذرخواهی یا اشاره به قطع شدن ننویس.';
 const SHARED_SEARCH_PREAMBLE_HOLD_MS = 1500;
 
 const SHARED_GEMINI_TOOLS = [
@@ -1006,6 +1007,28 @@ async function streamOneGeminiRound({ contents, modelName, key, externalSignal, 
 // «ناقص» یعنی متن رسیده ولی هیچ finishReason (STOP/MAX_TOKENS/...) نیامده.
 // در این حالت متن قبلی را به‌عنوان نوبت model و یک دستور «ادامه بده» به‌عنوان
 // نوبت user اضافه می‌کنیم؛ متن جدید مستقیم به ادامه‌ی همان پیام پخش می‌شود.
+// FIX: کمک‌تابع برای رفع کلمه‌ی نصفه هنگام «ادامه‌ی استریم». آخرین بخش متنیِ
+// آرایه‌ی parts (نوبت model) را می‌گیرد، اگر به فاصله/newline/علامت نگارشی
+// ختم نمی‌شود (یعنی وسط یک کلمه قطع شده)، همان کلمه‌ی ناقصِ انتهایی را حذف
+// می‌کند تا وقتی به مدل به‌عنوان تاریخچه پس داده می‌شود، از مرز یک کلمه‌ی
+// کامل ادامه بگیرد، نه وسط آن. اگر متن با فاصله/نگارش تمام شده (یعنی قطعی
+// دقیقاً بین دو کلمه بوده)، دست‌نخورده برمی‌گردد.
+function trimTrailingPartialWord(parts) {
+    if (!Array.isArray(parts) || !parts.length) return parts;
+    const result = parts.map(p => ({ ...p }));
+    for (let i = result.length - 1; i >= 0; i--) {
+        if (typeof result[i].text !== 'string' || !result[i].text) continue;
+        const text = result[i].text;
+        // اگر آخرین کاراکتر فاصله/نیم‌فاصله/newline/علامت نگارشی است، کلمه کامل بوده - دست نزن.
+        if (/[\s\u200c.,!?؛،:؟\-)\]}»"'`]$/.test(text)) return result;
+        // آخرین «کلمه»ی ناقص را (تا اولین فاصله/نیم‌فاصله قبل از انتهای متن) پیدا و حذف کن.
+        const cut = text.search(/[\s\u200c]+\S*$/);
+        result[i].text = cut === -1 ? '' : text.slice(0, cut + 1);
+        return result;
+    }
+    return result;
+}
+
 async function streamRoundWithRecovery({ contents, modelName, key, externalSignal, firstByteTimeoutMs, includeTools, onText, searchIntent }) {
     let workingContents = contents;
     let combinedText = '';
@@ -1033,9 +1056,19 @@ async function streamRoundWithRecovery({ contents, modelName, key, externalSigna
             return { ...round, text: combinedText + marker, finishReason: 'INCOMPLETE_STREAM' };
         }
         console.warn(`[shared-chats] stream cut without finishReason; continuing (attempt ${attempt + 1}/${SHARED_MAX_STREAM_RECOVERIES}, chars=${combinedText.length}, interrupted=${round.interrupted})`);
+        // FIX (کلمه‌ی نصفه‌شده هنگام ادامه‌ی استریم، مثل «چطورتری»/«می‌آاد»):
+        // وقتی استریم دقیقاً وسط یک کلمه قطع می‌شود، مدل در ادامه، بخشی از همان
+        // کلمه‌ی ناقص را از نو (کمی متفاوت) می‌نویسد و به باقی‌مانده‌ی قبلی می‌چسبد.
+        // راه‌حل: آخرین کلمه‌ی ناقص را از انتهای متنی که به‌عنوان تاریخچه به مدل
+        // پس داده می‌شود (parts مربوط به نقش model) قطع می‌کنیم تا مدل دقیقاً از
+        // یک مرز کلمه/فاصله ادامه بدهد، نه وسط یک کلمه. کاراکترهای بریده‌شده را
+        // به‌عنوان چانک منفی به onText نمی‌فرستیم چون قبلاً استریم شده‌اند؛ فقط
+        // در تاریخچه‌ی ارسالی به مدل حذف می‌شوند - combinedText خودش دست‌نخورده
+        // می‌ماند چون هرچه کاربر تا این لحظه دیده را نباید از UI پاک کنیم.
+        const trimmedParts = trimTrailingPartialWord(round.parts);
         workingContents = [
             ...workingContents,
-            { role: 'model', parts: round.parts },
+            { role: 'model', parts: trimmedParts },
             { role: 'user', parts: [{ text: SHARED_CONTINUE_PROMPT }] }
         ];
     }
