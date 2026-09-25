@@ -585,38 +585,6 @@ function getSearchResultText(result) {
     return `[جستجوی وب ناموفق بود | ${result.code || 'search_error'}] ${result.message || 'نتیجه‌ای دریافت نشد.'}`;
 }
 
-function isFreshWebIntent(query) {
-    const q = String(query || '').toLowerCase();
-    return /\b(now|today|latest|current|live|price|rate|exchange|dollar|usd|eur|news|recent|latest)\b/i.test(q) ||
-        /\b(الان|امروز|فعلی|لحظه|جدیدترین|جدید|قیمت|نرخ|دلار|یورو|اخبار|خبر|تازه)\b/.test(q);
-}
-
-function buildFreshSearchQuery(query) {
-    const clean = String(query || '').trim();
-    if (!clean) return clean;
-    if (!isFreshWebIntent(clean)) return clean;
-    const today = new Date().toISOString().slice(0, 10);
-    return `${clean} امروز ${today}`;
-}
-
-function extractSearchSources(data) {
-    if (!Array.isArray(data?.results)) return [];
-    return data.results.slice(0, 2).map(r => ({
-        title: String(r?.title || 'منبع وب').slice(0, 240),
-        url: String(r?.url || '').trim()
-    })).filter(x => /^https?:\/\//i.test(x.url));
-}
-
-function appendSearchSources(text, searchResult) {
-    const body = String(text || '').trim();
-    const sources = Array.isArray(searchResult?.sources) ? searchResult.sources : [];
-    if (!body || !sources.length) return body;
-    const missing = sources.filter(s => !body.includes(s.url));
-    if (!missing.length) return body;
-    const lines = missing.map(s => `- [${s.title}](${s.url})`).join('\n');
-    return `${body}\n\n**منابع وب:**\n${lines}`;
-}
-
 async function fetchTavilyResults(query, searchCache, externalSignal) {
     const keys = getTavilyKeys();
     if (!keys.length) {
@@ -630,7 +598,6 @@ async function fetchTavilyResults(query, searchCache, externalSignal) {
     }
 
     const cacheKey = String(query || '').trim().toLowerCase();
-    const freshQuery = buildFreshSearchQuery(cacheKey);
     if (!cacheKey) {
         return { ok: false, code: 'search_empty_query', status: 400, retryable: false, message: 'عبارت جستجو خالی بود.' };
     }
@@ -651,10 +618,9 @@ async function fetchTavilyResults(query, searchCache, externalSignal) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 api_key: currentKey,
-                query: freshQuery,
+                query: cacheKey,
                 search_depth: 'basic',
-                max_results: 2,
-                ...(isFreshWebIntent(cacheKey) ? { time_range: 'day' } : {})
+                max_results: 2
             }),
             signal: abort.controller.signal
         });
@@ -677,14 +643,13 @@ async function fetchTavilyResults(query, searchCache, externalSignal) {
         }
 
         markTavilyKeyResult(currentKey, true);
-        const sources = extractSearchSources(data);
-        const formatted = data.results.slice(0, 2).map(r =>
+        const formatted = data.results.map(r =>
             `عنوان: ${r.title || 'بدون عنوان'}\n` +
             `منبع: ${r.url || 'نامشخص'}\n` +
             `محتوا: ${String(r.content || '').slice(0, 1800)}`
         ).join('\n\n---\n\n');
 
-        const success = { ok: true, code: 'search_success', status: 200, result: formatted, sources };
+        const success = { ok: true, code: 'search_success', status: 200, result: formatted };
         if (searchCache) searchCache.set(cacheKey, success);
         return success;
     } catch (err) {
@@ -839,7 +804,7 @@ async function getBotReply(historyForPrompt, model, externalSignal) {
                 const text = extractGeminiText(secondData).trim();
                 if (text) {
                     markGeminiKeyResult(key, true);
-                    return appendSearchSources(text, searchResult);
+                    return text;
                 }
                 const why = secondData?.candidates?.[0]?.finishReason || secondData?.promptFeedback?.blockReason || 'no candidates';
                 failures.push(`${geminiKeyLabel(geminiKeys, key)}: follow-up بدون متن (${String(why).slice(0, 160)})`);
@@ -1096,33 +1061,33 @@ function trimTrailingPartialWord(parts) {
     return result;
 }
 
-function emitMissingSearchSources(accumulatedText, searchResult, onText) {
-    const body = String(accumulatedText || '').trim();
-    const sources = Array.isArray(searchResult?.sources) ? searchResult.sources : [];
-    const missing = sources.filter(s => s?.url && !body.includes(s.url));
-    if (!missing.length) return body;
-    const block = `\n\n**منابع وب:**\n${missing.map(s => `- [${s.title}](${s.url})`).join('\n')}`;
-    try { onText(block); } catch (_) {}
-    return `${body}${block}`;
-}
-
-
-function removeStreamOverlap(previousText, nextText) {
+function longestTextOverlap(previousText, nextText) {
     const previous = String(previousText || '');
     const next = String(nextText || '');
-    if (!previous || !next) return next;
-    const max = Math.min(1400, previous.length, next.length);
-    const min = Math.min(24, max);
-    for (let len = max; len >= min; len--) {
-        if (previous.slice(-len) === next.slice(0, len)) return next.slice(len);
+    if (!previous || !next) return 0;
+    const max = Math.min(previous.length, next.length, 1200);
+    const suffix = previous.slice(-max);
+    const lowerSuffix = suffix.toLocaleLowerCase();
+    const lowerNext = next.toLocaleLowerCase();
+    for (let len = max; len >= 24; len--) {
+        if (lowerSuffix.slice(-len) === lowerNext.slice(0, len)) return len;
     }
-    return next;
+    // برای تکرارهای کوتاه‌تر هم یک حداقل محافظ داریم؛ این فقط وقتی متن دقیقاً
+    // از ابتدای پاسخ قبلی دوباره شروع شده باشد فعال می‌شود.
+    for (let len = Math.min(max, 23); len >= 8; len--) {
+        if (lowerSuffix.slice(-len) === lowerNext.slice(0, len)) return len;
+    }
+    return 0;
 }
 
 async function streamRoundWithRecovery({ contents, modelName, key, externalSignal, firstByteTimeoutMs, includeTools, onText, searchIntent }) {
     let workingContents = contents;
     let combinedText = '';
     for (let attempt = 0; ; attempt++) {
+        // در round اول، متن را زنده پخش می‌کنیم. در recovery باید کل round جدید را
+        // موقتاً نگه داریم تا قبل از نمایش، overlap ابتدای آن با انتهای پاسخ قبلی
+        // حذف شود؛ وگرنه Gemini ممکن است چند جمله‌ی قبلی را دوباره تولید کند.
+        let roundStreamText = '';
         const round = await streamOneGeminiRound({
             contents: workingContents,
             modelName,
@@ -1130,14 +1095,30 @@ async function streamRoundWithRecovery({ contents, modelName, key, externalSigna
             externalSignal,
             timeoutMs: firstByteTimeoutMs,
             includeTools: attempt === 0 ? includeTools : false,
-            onText: () => {},
+            onText: piece => {
+                if (!piece) return;
+                roundStreamText += piece;
+                if (attempt === 0) {
+                    try { onText(piece); } catch (_) {}
+                }
+            },
             searchIntent: attempt === 0 ? searchIntent : false
         });
-        const deltaText = attempt === 0 ? round.text : removeStreamOverlap(combinedText, round.text);
-        if (deltaText) {
-            combinedText += deltaText;
-            try { onText(deltaText); } catch (_) {}
+
+        const previousVisible = combinedText;
+        let visibleRoundText = round.text;
+        if (attempt > 0 && visibleRoundText) {
+            const overlap = longestTextOverlap(previousVisible, visibleRoundText);
+            if (overlap > 0) {
+                visibleRoundText = visibleRoundText.slice(overlap);
+                console.warn(`[shared-chats] recovery overlap removed: ${overlap} chars`);
+            }
+            if (visibleRoundText) {
+                try { onText(visibleRoundText); } catch (_) {}
+            }
         }
+
+        combinedText += visibleRoundText;
         if (round.functionCall) return { ...round, text: combinedText };
 
         const incomplete = !round.finishReason && round.text.trim().length > 0;
@@ -1168,7 +1149,7 @@ async function streamRoundWithRecovery({ contents, modelName, key, externalSigna
     }
 }
 
-async function streamBotReplyWithModel(historyForPrompt, model, onChunk, externalSignal, onStep, onSources) {
+async function streamBotReplyWithModel(historyForPrompt, model, onChunk, externalSignal, onStep) {
     const geminiKeys = getGeminiKeys();
     if (!geminiKeys.length) throw new Error('GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.');
 
@@ -1222,9 +1203,6 @@ async function streamBotReplyWithModel(historyForPrompt, model, onChunk, externa
                 }
                 const searchResult = await fetchTavilyResults(query, searchCache, externalSignal);
                 searchState.result = searchResult;
-                if (onSources && searchResult?.sources?.length) {
-                    try { onSources(searchResult.sources); } catch (_) {}
-                }
 
                 const remainingAfterSearch = BOT_TOTAL_BUDGET_MS - (Date.now() - startedAt);
                 if (remainingAfterSearch < SHARED_GEMINI_MIN_REMAINING_MS) {
@@ -1278,7 +1256,7 @@ async function streamBotReplyWithModel(historyForPrompt, model, onChunk, externa
 
                 if (secondRound.text.trim()) {
                     markGeminiKeyResult(key, true);
-                    return emitMissingSearchSources(accumulatedAnswer, searchState.result, onChunk);
+                    return accumulatedAnswer.trim();
                 }
 
                 const why = secondRound.finishReason || 'follow-up بدون متن';
@@ -1295,7 +1273,7 @@ async function streamBotReplyWithModel(historyForPrompt, model, onChunk, externa
 
             if (round.text.trim()) {
                 markGeminiKeyResult(key, true);
-                return emitMissingSearchSources(accumulatedAnswer, searchState.result, onChunk);
+                return accumulatedAnswer.trim();
             }
 
             const why = round.finishReason || 'no candidates';
@@ -1349,7 +1327,7 @@ const SHARED_MODEL_FALLBACKS = {
     'gemini-3.1-pro-preview': ['gemini-3.6-flash', 'gemini-3.5-flash-lite']
 };
 
-async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, onStep, onSources) {
+async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, onStep) {
     const primary = model || DEFAULT_MODEL;
     const modelsToTry = [primary, ...(SHARED_MODEL_FALLBACKS[primary] || [])];
     let emittedAny = false;
@@ -1359,7 +1337,7 @@ async function streamBotReply(historyForPrompt, model, onChunk, externalSignal, 
         if (externalSignal?.aborted) return '';
         try {
             if (i > 0) console.warn(`[shared-chats] falling back to model ${modelsToTry[i]} (primary=${primary})`);
-            return await streamBotReplyWithModel(historyForPrompt, modelsToTry[i], trackedOnChunk, externalSignal, onStep, onSources);
+            return await streamBotReplyWithModel(historyForPrompt, modelsToTry[i], trackedOnChunk, externalSignal, onStep);
         } catch (err) {
             lastErr = err;
             // اگر چیزی از پاسخ قبلاً به کاربر رسیده، مدل عوض نکن تا متن تکراری/ناجور نشود.
